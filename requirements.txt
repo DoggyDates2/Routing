@@ -1,0 +1,4 @@
+ortools
+gspread
+google-auth
+pandas
