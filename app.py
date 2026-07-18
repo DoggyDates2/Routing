@@ -18,7 +18,7 @@ from solver import solve_simple_trip, solve_interleaved_trip
 # CONFIG
 # =============================================================================
 
-MATRIX_FILE = "Updated_Matrix_07_26_-_Minutes.csv"
+MATRIX_FILE = "Updated Matrix 07_26 - Minutes.csv"
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
