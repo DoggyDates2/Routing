@@ -36,15 +36,30 @@ OUTPUT_TAB_NAME = "Optimized Routes"
 def load_matrix(filepath):
     """Load distance matrix CSV into a nested dict for fast lookup."""
     matrix = {}
-    with open(filepath, "r") as f:
-        reader = csv.reader(f)
+    with open(filepath, "r", encoding="utf-8-sig") as f:
+        first_line = f.readline()
+        st.sidebar.write("First 100 chars:", first_line[:100])
+        st.sidebar.write("File size:", os.path.getsize(filepath))
+        f.seek(0)
+        
+        if first_line.count(";") > first_line.count(","):
+            delimiter = ";"
+        else:
+            delimiter = ","
+
+        reader = csv.reader(f, delimiter=delimiter)
         header = next(reader)
-        col_ids = [h.strip().replace("\r", "") for h in header[1:]]
+        col_ids = [h.strip().replace("\r", "") for h in header[1:] if h.strip()]
+        st.sidebar.write("Columns found:", len(col_ids))
 
         for row in reader:
             row_id = row[0].strip().replace("\r", "")
+            if not row_id:
+                continue
             matrix[row_id] = {}
             for i, col_id in enumerate(col_ids):
+                if i + 1 >= len(row):
+                    break
                 val_str = row[i + 1].strip().replace("\r", "")
                 if val_str:
                     matrix[row_id][col_id] = float(val_str.replace(",", "."))
