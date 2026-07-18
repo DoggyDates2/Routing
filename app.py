@@ -158,6 +158,8 @@ def parse_staff(data):
             "parking_id": parking_id,
             "capacity": capacity,
             "groups": groups,
+            "field_address": row[2].strip() if len(row) > 2 else "",
+            "parking_address": row[4].strip() if len(row) > 4 else "",
         }
     return drivers
 
@@ -210,6 +212,8 @@ def solve_driver(matrix, driver_name, config, dogs):
     field = config["field_id"]
     parking = config["parking_id"]
     capacity = config["capacity"]
+    field_address = config.get("field_address", "")
+    parking_address = config.get("parking_address", "")
 
     customer_dogs = [d for d in dogs if not d["is_staff_dog"]]
     staff_dogs = [d for d in dogs if d["is_staff_dog"]]
@@ -239,12 +243,15 @@ def solve_driver(matrix, driver_name, config, dogs):
                     if loc_id == parking:
                         action = "START"
                         label = "Leave Parking"
+                        addr = parking_address
                     elif loc_id == field:
                         action = "ARRIVE"
                         label = "Arrive at Field"
+                        addr = field_address
                     else:
                         action = "PICK UP"
                         label = d.get("dog_name", loc_id)
+                        addr = d.get("address", "")
                     results.append({
                         "Driver": driver_name,
                         "Leg": leg_num + 1,
@@ -252,7 +259,7 @@ def solve_driver(matrix, driver_name, config, dogs):
                         "Action": action,
                         "Customer ID": loc_id,
                         "Dog Name": label,
-                        "Address": d.get("address", ""),
+                        "Address": addr,
                         "Dogs at Stop": d.get("dog_count", ""),
                         "Dogs on Board": "",
                         "Drive Min": round(dist, 1) if loc_id == field else "",
@@ -301,10 +308,13 @@ def solve_driver(matrix, driver_name, config, dogs):
                     d = dog_lookup.get(loc_id, {})
                     if action_raw == "LEAVE FIELD":
                         label = "Leave Field"
+                        addr = field_address
                     elif action_raw == "ARRIVE FIELD":
                         label = "Arrive at Field"
+                        addr = field_address
                     else:
                         label = d.get("dog_name", loc_id)
+                        addr = d.get("address", "")
                     results.append({
                         "Driver": driver_name,
                         "Leg": leg_num + 1,
@@ -312,7 +322,7 @@ def solve_driver(matrix, driver_name, config, dogs):
                         "Action": action_raw,
                         "Customer ID": loc_id,
                         "Dog Name": label,
-                        "Address": d.get("address", ""),
+                        "Address": addr,
                         "Dogs at Stop": d.get("dog_count", ""),
                         "Dogs on Board": load,
                         "Drive Min": round(dist, 1) if action_raw == "ARRIVE FIELD" else "",
@@ -338,12 +348,15 @@ def solve_driver(matrix, driver_name, config, dogs):
                     if loc_id == field:
                         action = "LEAVE"
                         label = "Leave Field"
+                        addr = field_address
                     elif loc_id == parking:
                         action = "ARRIVE"
                         label = "Arrive at Parking"
+                        addr = parking_address
                     else:
                         action = "DROP OFF"
                         label = d.get("dog_name", loc_id)
+                        addr = d.get("address", "")
                     results.append({
                         "Driver": driver_name,
                         "Leg": leg_num + 1,
@@ -351,7 +364,7 @@ def solve_driver(matrix, driver_name, config, dogs):
                         "Action": action,
                         "Customer ID": loc_id,
                         "Dog Name": label,
-                        "Address": d.get("address", ""),
+                        "Address": addr,
                         "Dogs at Stop": d.get("dog_count", ""),
                         "Dogs on Board": "",
                         "Drive Min": round(dist, 1) if loc_id == parking else "",
