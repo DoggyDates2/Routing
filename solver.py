@@ -19,7 +19,7 @@ def build_trip_matrix(matrix, all_ids):
     return dist
 
 
-def solve_simple_trip(matrix, stop_ids, start_id, end_id, time_limit=5):
+def solve_simple_trip(matrix, stop_ids, start_id, end_id, time_limit=1):
     """
     Solve a simple TSP: visit all stops between a fixed start and end.
     Used for first leg (pickup only) and last leg (dropoff only).
