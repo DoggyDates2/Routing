@@ -492,16 +492,39 @@ def main():
 
     # ── Optimize ──
     st.markdown("---")
+
+    # Driver selection
+    all_driver_names = sorted([d["Driver"] for d in active_drivers_with_dogs])
+    
+    col_select1, col_select2 = st.columns([1, 1])
+    with col_select1:
+        select_all = st.checkbox("Select all drivers", value=True)
+    
+    if select_all:
+        selected_drivers = all_driver_names
+    else:
+        selected_drivers = st.multiselect(
+            "Select drivers to optimize:",
+            all_driver_names,
+            default=[]
+        )
+
     col1, col2 = st.columns([1, 3])
     with col1:
-        optimize_btn = st.button("🚀 Optimize All Routes", type="primary", use_container_width=True)
+        optimize_btn = st.button(
+            f"🚀 Optimize {len(selected_drivers)} Driver{'s' if len(selected_drivers) != 1 else ''}",
+            type="primary",
+            use_container_width=True,
+            disabled=len(selected_drivers) == 0
+        )
 
     if optimize_btn:
         all_results = []
         errors = []
         progress = st.progress(0, text="Starting...")
 
-        driver_list = sorted(active_drivers_with_dogs, key=lambda x: x["Driver"])
+        driver_list = [d for d in sorted(active_drivers_with_dogs, key=lambda x: x["Driver"])
+                       if d["Driver"] in selected_drivers]
 
         # Prepare all driver jobs
         driver_jobs = []
@@ -541,14 +564,94 @@ def main():
         progress.progress(1.0, text="Done!")
         st.session_state["results"] = all_results
         st.session_state["errors"] = errors
+        st.session_state["selected_drivers_for_validation"] = selected_drivers
 
     # ── Display results ──
     if "results" in st.session_state and st.session_state["results"]:
         results = st.session_state["results"]
         errors = st.session_state.get("errors", [])
+        validated_drivers = st.session_state.get("selected_drivers_for_validation", [])
 
         if errors:
             st.error(f"Errors on {len(errors)} drivers: {errors}")
+
+        # ── VALIDATION: Check for missing stops ──
+        validation_issues = []
+        for driver_name in validated_drivers:
+            if driver_name not in drivers:
+                continue
+            config = drivers[driver_name]
+            
+            # Expected: all non-staff dogs assigned to this driver
+            expected_dogs = [
+                a for a in assignments
+                if a["driver"] == driver_name
+                and a["pickup_group"] in config["groups"]
+                and not a["is_staff_dog"]
+            ]
+            expected_ids = set(a["customer_id"] for a in expected_dogs)
+            
+            # Actual: all customer stops in the results (exclude field/parking)
+            driver_results = [r for r in results if r["Driver"] == driver_name]
+            routed_ids = set(
+                r["Customer ID"] for r in driver_results
+                if r["Action"] in ("PICK UP", "DROP OFF")
+            )
+            
+            # Check for missing pickups
+            missing_from_route = expected_ids - routed_ids
+            if missing_from_route:
+                for mid in missing_from_route:
+                    dog_info = next((a for a in expected_dogs if a["customer_id"] == mid), {})
+                    reason = "not in matrix" if mid not in matrix else "unknown"
+                    validation_issues.append({
+                        "Driver": driver_name,
+                        "Missing Customer ID": mid,
+                        "Dog Name": dog_info.get("dog_name", "?"),
+                        "Address": dog_info.get("address", "?"),
+                        "Reason": reason,
+                    })
+            
+            # Check each dog appears in both a pickup AND a dropoff
+            pickup_ids = set(
+                r["Customer ID"] for r in driver_results
+                if r["Action"] == "PICK UP"
+            )
+            dropoff_ids = set(
+                r["Customer ID"] for r in driver_results
+                if r["Action"] == "DROP OFF"
+            )
+            picked_not_dropped = pickup_ids - dropoff_ids
+            dropped_not_picked = dropoff_ids - pickup_ids
+            
+            for mid in picked_not_dropped:
+                dog_info = next((a for a in expected_dogs if a["customer_id"] == mid), {})
+                validation_issues.append({
+                    "Driver": driver_name,
+                    "Missing Customer ID": mid,
+                    "Dog Name": dog_info.get("dog_name", "?"),
+                    "Address": dog_info.get("address", "?"),
+                    "Reason": "picked up but never dropped off",
+                })
+            for mid in dropped_not_picked:
+                dog_info = next((a for a in expected_dogs if a["customer_id"] == mid), {})
+                validation_issues.append({
+                    "Driver": driver_name,
+                    "Missing Customer ID": mid,
+                    "Dog Name": dog_info.get("dog_name", "?"),
+                    "Address": dog_info.get("address", "?"),
+                    "Reason": "dropped off but never picked up",
+                })
+
+        if validation_issues:
+            st.error(f"🚨 {len(validation_issues)} MISSING STOPS DETECTED:")
+            st.dataframe(
+                pd.DataFrame(validation_issues),
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.success("✅ All dogs accounted for — every pickup has a dropoff.")
 
         st.subheader(f"Optimized Routes ({len(results)} total stops)")
 
