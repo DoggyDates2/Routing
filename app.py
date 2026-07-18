@@ -262,6 +262,7 @@ def solve_driver(matrix, driver_name, config, dogs):
                         "Address": addr,
                         "Dogs at Stop": d.get("dog_count", ""),
                         "Dogs on Board": "",
+                        "Assignment": d.get("raw", ""),
                         "Drive Min": round(dist, 1) if loc_id == field else "",
                     })
 
@@ -325,6 +326,7 @@ def solve_driver(matrix, driver_name, config, dogs):
                         "Address": addr,
                         "Dogs at Stop": d.get("dog_count", ""),
                         "Dogs on Board": load,
+                        "Assignment": d.get("raw", ""),
                         "Drive Min": round(dist, 1) if action_raw == "ARRIVE FIELD" else "",
                     })
 
@@ -333,7 +335,7 @@ def solve_driver(matrix, driver_name, config, dogs):
             last_group = groups[-1]
             dropoff_dogs = [
                 d for d in customer_dogs
-                if d["dropoff_group"] == last_group and d["customer_id"] in matrix
+                if d["dropoff_group"] >= last_group and d["customer_id"] in matrix
             ]
             if not dropoff_dogs:
                 continue
@@ -367,6 +369,7 @@ def solve_driver(matrix, driver_name, config, dogs):
                         "Address": addr,
                         "Dogs at Stop": d.get("dog_count", ""),
                         "Dogs on Board": "",
+                        "Assignment": d.get("raw", ""),
                         "Drive Min": round(dist, 1) if loc_id == parking else "",
                     })
 
@@ -389,11 +392,11 @@ def write_results_to_sheet(client, sheet_name, all_results):
         pass
 
     # Create new tab
-    ws = sheet.add_worksheet(title=OUTPUT_TAB_NAME, rows=len(all_results) + 1, cols=10)
+    ws = sheet.add_worksheet(title=OUTPUT_TAB_NAME, rows=len(all_results) + 1, cols=11)
 
     # Write header
     header = ["Driver", "Leg", "Stop", "Action", "Customer ID",
-              "Dog Name", "Address", "Dogs at Stop", "Dogs on Board", "Drive Min"]
+              "Dog Name", "Address", "Dogs at Stop", "Dogs on Board", "Assignment", "Drive Min"]
     ws.update(range_name="A1", values=[header])
 
     # Write data
@@ -402,7 +405,7 @@ def write_results_to_sheet(client, sheet_name, all_results):
         rows.append([
             r["Driver"], r["Leg"], r["Stop"], r["Action"],
             r["Customer ID"], r["Dog Name"], r["Address"],
-            r["Dogs at Stop"], r["Dogs on Board"], r["Drive Min"],
+            r["Dogs at Stop"], r["Dogs on Board"], r.get("Assignment", ""), r["Drive Min"],
         ])
 
     if rows:
@@ -586,7 +589,6 @@ def main():
             expected_dogs = [
                 a for a in assignments
                 if a["driver"] == driver_name
-                and a["pickup_group"] in config["groups"]
                 and not a["is_staff_dog"]
             ]
             expected_ids = set(a["customer_id"] for a in expected_dogs)
