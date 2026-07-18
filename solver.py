@@ -69,7 +69,7 @@ def solve_simple_trip(matrix, stop_ids, start_id, end_id, time_limit=1):
 
 def solve_interleaved_trip(matrix, dropoff_customers, pickup_customers,
                            start_id, end_id, capacity, initial_load,
-                           time_limit=10):
+                           time_limit=3):
     """
     Solve an interleaved trip: drop off one group while picking up the next.
     
