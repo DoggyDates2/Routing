@@ -365,6 +365,10 @@ def main():
     st.title("🐕 Doggy Dates Route Optimizer")
 
     # ── Load matrix ──
+    st.sidebar.write("Looking for:", MATRIX_FILE)
+    st.sidebar.write("Current directory:", os.getcwd())
+    st.sidebar.write("Files here:", os.listdir("."))
+    
     if not os.path.exists(MATRIX_FILE):
         st.error(f"Matrix file '{MATRIX_FILE}' not found. Make sure it's in the repo.")
         st.stop()
