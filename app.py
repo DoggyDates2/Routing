@@ -18,13 +18,13 @@ from solver import solve_simple_trip, solve_interleaved_trip
 # CONFIG
 # =============================================================================
 
-MATRIX_FILE = "matrix.csv"
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
 # Set this to your Google Sheet name or ID
 SHEET_NAME = st.secrets.get("sheet_name", "Routing")
+MATRIX_FILE_NAME = st.secrets.get("matrix_file_name", "matrix.csv")
 OUTPUT_TAB_NAME = "Optimized Routes"
 
 
@@ -32,39 +32,67 @@ OUTPUT_TAB_NAME = "Optimized Routes"
 # DATA LOADING
 # =============================================================================
 
-@st.cache_data(show_spinner="Loading distance matrix...")
-def load_matrix(filepath):
-    """Load distance matrix CSV into a nested dict for fast lookup."""
+@st.cache_data(show_spinner="Loading distance matrix from Google Drive...")
+def load_matrix_from_drive(_client, file_name):
+    """Download matrix CSV from Google Drive and parse it."""
+    # Find the file in Google Drive
+    file_list = _client.list_spreadsheet_files()
+    # That only lists spreadsheets — use raw Drive API instead
+    import io
+    from google.oauth2.service_account import Credentials as Creds
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaIoBaseDownload
+
+    creds = Creds.from_service_account_info(
+        st.secrets["gcp_service_account"], scopes=SCOPES
+    )
+    drive_service = build("drive", "v3", credentials=creds)
+
+    # Search for the file by name
+    results = drive_service.files().list(
+        q=f"name='{file_name}' and trashed=false",
+        fields="files(id, name, size)"
+    ).execute()
+    files = results.get("files", [])
+
+    if not files:
+        st.error(f"Could not find '{file_name}' in Google Drive. "
+                 "Make sure the file is shared with your service account email.")
+        st.stop()
+
+    file_id = files[0]["id"]
+    st.sidebar.write(f"Found matrix: {files[0]['name']} ({files[0].get('size', '?')} bytes)")
+
+    # Download the file
+    request = drive_service.files().get_media(fileId=file_id)
+    content = io.BytesIO()
+    downloader = MediaIoBaseDownload(content, request)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+
+    content.seek(0)
+    text = content.read().decode("utf-8-sig")
+
+    # Parse CSV
     matrix = {}
-    with open(filepath, "r", encoding="utf-8-sig") as f:
-        first_line = f.readline()
-        st.sidebar.write("First 100 chars:", first_line[:100])
-        st.sidebar.write("File size:", os.path.getsize(filepath))
-        f.seek(0)
-        
-        if first_line.count(";") > first_line.count(","):
-            delimiter = ";"
-        else:
-            delimiter = ","
+    reader = csv.reader(io.StringIO(text))
+    header = next(reader)
+    col_ids = [h.strip().replace("\r", "") for h in header[1:] if h.strip()]
 
-        reader = csv.reader(f, delimiter=delimiter)
-        header = next(reader)
-        col_ids = [h.strip().replace("\r", "") for h in header[1:] if h.strip()]
-        st.sidebar.write("Columns found:", len(col_ids))
-
-        for row in reader:
-            row_id = row[0].strip().replace("\r", "")
-            if not row_id:
-                continue
-            matrix[row_id] = {}
-            for i, col_id in enumerate(col_ids):
-                if i + 1 >= len(row):
-                    break
-                val_str = row[i + 1].strip().replace("\r", "")
-                if val_str:
-                    matrix[row_id][col_id] = float(val_str.replace(",", "."))
-                else:
-                    matrix[row_id][col_id] = 9999
+    for row in reader:
+        row_id = row[0].strip().replace("\r", "")
+        if not row_id:
+            continue
+        matrix[row_id] = {}
+        for i, col_id in enumerate(col_ids):
+            if i + 1 >= len(row):
+                break
+            val_str = row[i + 1].strip().replace("\r", "")
+            if val_str:
+                matrix[row_id][col_id] = float(val_str.replace(",", "."))
+            else:
+                matrix[row_id][col_id] = 9999
     return matrix
 
 
@@ -379,24 +407,16 @@ def main():
 
     st.title("🐕 Doggy Dates Route Optimizer")
 
-    # ── Load matrix ──
-    st.sidebar.write("Looking for:", MATRIX_FILE)
-    st.sidebar.write("Current directory:", os.getcwd())
-    st.sidebar.write("Files here:", os.listdir("."))
-    
-    if not os.path.exists(MATRIX_FILE):
-        st.error(f"Matrix file '{MATRIX_FILE}' not found. Make sure it's in the repo.")
-        st.stop()
-
-    matrix = load_matrix(MATRIX_FILE)
-    st.sidebar.success(f"Matrix loaded: {len(matrix)} locations")
-
     # ── Connect to Google Sheets ──
     try:
         client = get_gspread_client()
     except Exception as e:
         st.error(f"Could not connect to Google Sheets. Check your secrets. Error: {e}")
         st.stop()
+
+    # ── Load matrix from Google Drive ──
+    matrix = load_matrix_from_drive(client, MATRIX_FILE_NAME)
+    st.sidebar.success(f"Matrix loaded: {len(matrix)} locations")
 
     # ── Load data from Sheets ──
     with st.spinner("Reading from Google Sheets..."):
@@ -470,22 +490,40 @@ def main():
 
         driver_list = sorted(active_drivers_with_dogs, key=lambda x: x["Driver"])
 
-        for i, driver_info in enumerate(driver_list):
+        # Prepare all driver jobs
+        driver_jobs = []
+        for driver_info in driver_list:
             name = driver_info["Driver"]
-            progress.progress(
-                (i + 1) / len(driver_list),
-                text=f"Solving {name} ({i + 1}/{len(driver_list)})..."
-            )
-
             config = drivers[name]
             dogs = [a for a in assignments if a["driver"] == name
                     and a["pickup_group"] in config["groups"]]
+            driver_jobs.append((matrix, name, config, dogs))
 
-            try:
-                results = solve_driver(matrix, name, config, dogs)
-                all_results.extend(results)
-            except Exception as e:
-                errors.append(f"{name}: {str(e)}")
+        # Solve in parallel
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        import multiprocessing
+
+        # Use up to 4 workers (Streamlit Cloud typically has 2-4 cores)
+        n_workers = min(4, multiprocessing.cpu_count(), len(driver_jobs))
+
+        completed = 0
+        with ProcessPoolExecutor(max_workers=n_workers) as executor:
+            futures = {
+                executor.submit(solve_driver, *job): job[1]
+                for job in driver_jobs
+            }
+            for future in as_completed(futures):
+                name = futures[future]
+                completed += 1
+                progress.progress(
+                    completed / len(driver_list),
+                    text=f"Solved {name} ({completed}/{len(driver_list)})..."
+                )
+                try:
+                    results = future.result()
+                    all_results.extend(results)
+                except Exception as e:
+                    errors.append(f"{name}: {str(e)}")
 
         progress.progress(1.0, text="Done!")
         st.session_state["results"] = all_results
