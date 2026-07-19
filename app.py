@@ -745,16 +745,21 @@ def main():
         else:
             st.success(f"✅ All dogs accounted for across {len(optimized_drivers)} drivers.")
 
-        # Outlier check — flag stops more than 10 min apart
+        # Outlier check — only flag long gaps between dog stops (not to/from field or parking)
         outliers = []
-        for r in results:
-            if r.get("Min to Next") and r["Min to Next"] != "" and r["Min to Next"] > 10:
+        for i in range(len(results) - 1):
+            r = results[i]
+            nxt = results[i + 1]
+            if (r.get("Min to Next") and r["Min to Next"] != ""
+                and r["Min to Next"] > 10
+                and r["Action"] in ("PICK UP", "DROP OFF")
+                and nxt["Action"] in ("PICK UP", "DROP OFF")):
                 outliers.append({
                     "Driver": r["Driver"],
                     "Leg": r["Leg"],
                     "From": r["Dog Name"],
-                    "From Address": r["Address"],
-                    "Min to Next": r["Min to Next"],
+                    "To": nxt["Dog Name"],
+                    "Min Between": r["Min to Next"],
                 })
         if outliers:
             st.warning(f"⚠️ {len(outliers)} long gaps between stops (over 10 min):")
