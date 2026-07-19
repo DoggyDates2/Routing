@@ -10,7 +10,7 @@ from google.oauth2.service_account import Credentials
 import pandas as pd
 import csv
 import re
-import time
+import io
 import os
 from solver import solve_simple_trip, solve_interleaved_trip
 
@@ -22,10 +22,10 @@ SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
-# Set this to your Google Sheet name or ID
 SHEET_NAME = st.secrets.get("sheet_name", "Routing")
 MATRIX_FILE_NAME = st.secrets.get("matrix_file_name", "matrix.csv")
 OUTPUT_TAB_NAME = "Optimized Routes"
+SNAPSHOT_TAB_NAME = "Route Snapshot"
 
 
 # =============================================================================
@@ -35,10 +35,6 @@ OUTPUT_TAB_NAME = "Optimized Routes"
 @st.cache_data(show_spinner="Loading distance matrix from Google Drive...")
 def load_matrix_from_drive(_client, file_name):
     """Download matrix CSV from Google Drive and parse it."""
-    # Find the file in Google Drive
-    file_list = _client.list_spreadsheet_files()
-    # That only lists spreadsheets — use raw Drive API instead
-    import io
     from google.oauth2.service_account import Credentials as Creds
     from googleapiclient.discovery import build
     from googleapiclient.http import MediaIoBaseDownload
@@ -48,7 +44,6 @@ def load_matrix_from_drive(_client, file_name):
     )
     drive_service = build("drive", "v3", credentials=creds)
 
-    # Search for the file by name
     results = drive_service.files().list(
         q=f"name='{file_name}' and trashed=false",
         fields="files(id, name, size)"
@@ -61,9 +56,7 @@ def load_matrix_from_drive(_client, file_name):
         st.stop()
 
     file_id = files[0]["id"]
-    st.sidebar.write(f"Found matrix: {files[0]['name']} ({files[0].get('size', '?')} bytes)")
 
-    # Download the file
     request = drive_service.files().get_media(fileId=file_id)
     content = io.BytesIO()
     downloader = MediaIoBaseDownload(content, request)
@@ -74,7 +67,6 @@ def load_matrix_from_drive(_client, file_name):
     content.seek(0)
     text = content.read().decode("utf-8-sig")
 
-    # Parse CSV
     matrix = {}
     reader = csv.reader(io.StringIO(text))
     header = next(reader)
@@ -97,7 +89,6 @@ def load_matrix_from_drive(_client, file_name):
 
 
 def get_gspread_client():
-    """Connect to Google Sheets using service account credentials from Streamlit secrets."""
     creds = Credentials.from_service_account_info(
         st.secrets["gcp_service_account"], scopes=SCOPES
     )
@@ -105,19 +96,15 @@ def get_gspread_client():
 
 
 def load_staff_from_sheet(client, sheet_name):
-    """Read the Staff tab from Google Sheets."""
     sheet = client.open(sheet_name)
     ws = sheet.worksheet("Staff")
-    data = ws.get_all_values()
-    return data
+    return ws.get_all_values()
 
 
 def load_today_from_sheet(client, sheet_name):
-    """Read the Today tab from Google Sheets."""
     sheet = client.open(sheet_name)
     ws = sheet.worksheet("Today")
-    data = ws.get_all_values()
-    return data
+    return ws.get_all_values()
 
 
 # =============================================================================
@@ -125,9 +112,8 @@ def load_today_from_sheet(client, sheet_name):
 # =============================================================================
 
 def parse_staff(data):
-    """Parse Staff tab data into driver configs."""
     drivers = {}
-    for row in data[1:]:  # skip header
+    for row in data[1:]:
         if len(row) < 9:
             continue
         name = row[0].strip()
@@ -137,9 +123,7 @@ def parse_staff(data):
         parking_id = row[7].strip()
         capacity_str = row[8].strip()
 
-        if status == "OFF" or not field_id:
-            continue
-        if not capacity_str:
+        if status == "OFF" or not field_id or not capacity_str:
             continue
 
         capacity = int(capacity_str)
@@ -165,9 +149,8 @@ def parse_staff(data):
 
 
 def parse_today(data):
-    """Parse Today tab data into dog assignments."""
     assignments = []
-    for row in data[1:]:  # skip header
+    for row in data[1:]:
         if len(row) < 11:
             continue
 
@@ -207,7 +190,6 @@ def parse_today(data):
 # =============================================================================
 
 def solve_driver(matrix, driver_name, config, dogs):
-    """Solve all legs for a single driver. Returns list of route entries."""
     groups = config["groups"]
     field = config["field_id"]
     parking = config["parking_id"]
@@ -224,7 +206,6 @@ def solve_driver(matrix, driver_name, config, dogs):
     for leg_num in range(len(groups) + 1):
 
         if leg_num == 0:
-            # ── First leg: pickup only ──
             current_group = groups[0]
             pickup_dogs = [
                 d for d in customer_dogs
@@ -241,33 +222,20 @@ def solve_driver(matrix, driver_name, config, dogs):
                 for i, loc_id in enumerate(route):
                     d = dog_lookup.get(loc_id, {})
                     if loc_id == parking:
-                        action = "START"
-                        label = "Leave Parking"
-                        addr = parking_address
+                        action, label, addr = "START", "Leave Parking", parking_address
                     elif loc_id == field:
-                        action = "ARRIVE"
-                        label = "Arrive at Field"
-                        addr = field_address
+                        action, label, addr = "ARRIVE", "Arrive at Field", field_address
                     else:
-                        action = "PICK UP"
-                        label = d.get("dog_name", loc_id)
-                        addr = d.get("address", "")
+                        action, label, addr = "PICK UP", d.get("dog_name", loc_id), d.get("address", "")
                     results.append({
-                        "Driver": driver_name,
-                        "Leg": leg_num + 1,
-                        "Stop": i + 1,
-                        "Action": action,
-                        "Customer ID": loc_id,
-                        "Dog Name": label,
-                        "Address": addr,
-                        "Dogs at Stop": d.get("dog_count", ""),
-                        "Dogs on Board": "",
-                        "Assignment": d.get("raw", ""),
+                        "Driver": driver_name, "Leg": leg_num + 1, "Stop": i + 1,
+                        "Action": action, "Customer ID": loc_id, "Dog Name": label,
+                        "Address": addr, "Dogs at Stop": d.get("dog_count", ""),
+                        "Dogs on Board": "", "Assignment": d.get("raw", ""),
                         "Drive Min": round(dist, 1) if loc_id == field else "",
                     })
 
         elif leg_num < len(groups):
-            # ── Middle leg: interleaved ──
             prev_group = groups[leg_num - 1]
             next_group = groups[leg_num]
 
@@ -308,30 +276,20 @@ def solve_driver(matrix, driver_name, config, dogs):
                 for i, (loc_id, load, action_raw) in enumerate(route):
                     d = dog_lookup.get(loc_id, {})
                     if action_raw == "LEAVE FIELD":
-                        label = "Leave Field"
-                        addr = field_address
+                        label, addr = "Leave Field", field_address
                     elif action_raw == "ARRIVE FIELD":
-                        label = "Arrive at Field"
-                        addr = field_address
+                        label, addr = "Arrive at Field", field_address
                     else:
-                        label = d.get("dog_name", loc_id)
-                        addr = d.get("address", "")
+                        label, addr = d.get("dog_name", loc_id), d.get("address", "")
                     results.append({
-                        "Driver": driver_name,
-                        "Leg": leg_num + 1,
-                        "Stop": i + 1,
-                        "Action": action_raw,
-                        "Customer ID": loc_id,
-                        "Dog Name": label,
-                        "Address": addr,
-                        "Dogs at Stop": d.get("dog_count", ""),
-                        "Dogs on Board": load,
-                        "Assignment": d.get("raw", ""),
+                        "Driver": driver_name, "Leg": leg_num + 1, "Stop": i + 1,
+                        "Action": action_raw, "Customer ID": loc_id, "Dog Name": label,
+                        "Address": addr, "Dogs at Stop": d.get("dog_count", ""),
+                        "Dogs on Board": load, "Assignment": d.get("raw", ""),
                         "Drive Min": round(dist, 1) if action_raw == "ARRIVE FIELD" else "",
                     })
 
         else:
-            # ── Last leg: dropoff only ──
             last_group = groups[-1]
             dropoff_dogs = [
                 d for d in customer_dogs
@@ -348,28 +306,16 @@ def solve_driver(matrix, driver_name, config, dogs):
                 for i, loc_id in enumerate(route):
                     d = dog_lookup.get(loc_id, {})
                     if loc_id == field:
-                        action = "LEAVE"
-                        label = "Leave Field"
-                        addr = field_address
+                        action, label, addr = "LEAVE", "Leave Field", field_address
                     elif loc_id == parking:
-                        action = "ARRIVE"
-                        label = "Arrive at Parking"
-                        addr = parking_address
+                        action, label, addr = "ARRIVE", "Arrive at Parking", parking_address
                     else:
-                        action = "DROP OFF"
-                        label = d.get("dog_name", loc_id)
-                        addr = d.get("address", "")
+                        action, label, addr = "DROP OFF", d.get("dog_name", loc_id), d.get("address", "")
                     results.append({
-                        "Driver": driver_name,
-                        "Leg": leg_num + 1,
-                        "Stop": i + 1,
-                        "Action": action,
-                        "Customer ID": loc_id,
-                        "Dog Name": label,
-                        "Address": addr,
-                        "Dogs at Stop": d.get("dog_count", ""),
-                        "Dogs on Board": "",
-                        "Assignment": d.get("raw", ""),
+                        "Driver": driver_name, "Leg": leg_num + 1, "Stop": i + 1,
+                        "Action": action, "Customer ID": loc_id, "Dog Name": label,
+                        "Address": addr, "Dogs at Stop": d.get("dog_count", ""),
+                        "Dogs on Board": "", "Assignment": d.get("raw", ""),
                         "Drive Min": round(dist, 1) if loc_id == parking else "",
                     })
 
@@ -381,25 +327,19 @@ def solve_driver(matrix, driver_name, config, dogs):
 # =============================================================================
 
 def write_results_to_sheet(client, sheet_name, all_results):
-    """Write optimized routes to a new tab in the Google Sheet."""
     sheet = client.open(sheet_name)
-
-    # Delete existing output tab if it exists
     try:
         existing = sheet.worksheet(OUTPUT_TAB_NAME)
         sheet.del_worksheet(existing)
     except gspread.exceptions.WorksheetNotFound:
         pass
 
-    # Create new tab
     ws = sheet.add_worksheet(title=OUTPUT_TAB_NAME, rows=len(all_results) + 1, cols=11)
 
-    # Write header
     header = ["Driver", "Leg", "Stop", "Action", "Customer ID",
               "Dog Name", "Address", "Dogs at Stop", "Dogs on Board", "Assignment", "Drive Min"]
     ws.update(range_name="A1", values=[header])
 
-    # Write data
     rows = []
     for r in all_results:
         rows.append([
@@ -410,8 +350,75 @@ def write_results_to_sheet(client, sheet_name, all_results):
 
     if rows:
         ws.update(range_name="A2", values=rows)
-
     return len(rows)
+
+
+# =============================================================================
+# SNAPSHOT & CHANGE DETECTION
+# =============================================================================
+
+def save_snapshot(client, sheet_name, assignments):
+    """Save current assignments for change detection."""
+    sheet = client.open(sheet_name)
+    try:
+        existing = sheet.worksheet(SNAPSHOT_TAB_NAME)
+        sheet.del_worksheet(existing)
+    except gspread.exceptions.WorksheetNotFound:
+        pass
+
+    rows = [["Driver", "Customer ID", "Assignment", "Dog Count"]]
+    for a in assignments:
+        rows.append([a["driver"], a["customer_id"], a["raw"], a["dog_count"]])
+
+    ws = sheet.add_worksheet(title=SNAPSHOT_TAB_NAME, rows=len(rows), cols=4)
+    ws.update(range_name="A1", values=rows)
+
+
+def load_snapshot(client, sheet_name):
+    """Load last-optimized snapshot. Returns dict: driver -> set of (customer_id, assignment)."""
+    try:
+        sheet = client.open(sheet_name)
+        ws = sheet.worksheet(SNAPSHOT_TAB_NAME)
+        data = ws.get_all_values()
+    except Exception:
+        return None
+
+    snapshot = {}
+    for row in data[1:]:
+        if len(row) < 3:
+            continue
+        driver = row[0].strip()
+        cid = row[1].strip()
+        assignment = row[2].strip()
+        if driver not in snapshot:
+            snapshot[driver] = set()
+        snapshot[driver].add((cid, assignment))
+    return snapshot
+
+
+def detect_changes(assignments, snapshot):
+    """Compare current assignments against snapshot. Returns dict of changes per driver."""
+    if snapshot is None:
+        return None
+
+    current = {}
+    for a in assignments:
+        driver = a["driver"]
+        if driver not in current:
+            current[driver] = set()
+        current[driver].add((a["customer_id"], a["raw"]))
+
+    changes = {}
+    all_drivers = set(list(current.keys()) + list(snapshot.keys()))
+    for driver in all_drivers:
+        cur = current.get(driver, set())
+        prev = snapshot.get(driver, set())
+        if cur != prev:
+            added = cur - prev
+            removed = prev - cur
+            changes[driver] = {"added": added, "removed": removed}
+
+    return changes
 
 
 # =============================================================================
@@ -446,11 +453,10 @@ def main():
     drivers = parse_staff(staff_data)
     assignments = parse_today(today_data)
 
-    # ── Sidebar summary ──
-    st.sidebar.markdown("---")
     st.sidebar.markdown(f"**Active drivers:** {len(drivers)}")
     st.sidebar.markdown(f"**Dog assignments:** {len(assignments)}")
 
+    # ── Build driver info ──
     active_drivers_with_dogs = []
     for name in sorted(drivers.keys()):
         config = drivers[name]
@@ -460,22 +466,12 @@ def main():
             dog_count = sum(d["dog_count"] for d in dogs)
             staff_count = sum(d["dog_count"] for d in dogs if d["is_staff_dog"])
             active_drivers_with_dogs.append({
-                "Driver": name,
-                "Groups": str(config["groups"]),
-                "Capacity": config["capacity"],
-                "Dogs": dog_count,
-                "Staff Dogs": staff_count,
-                "Field": config["field_id"],
-                "Parking": config["parking_id"],
+                "name": name,
+                "groups": config["groups"],
+                "capacity": config["capacity"],
+                "dogs": dog_count,
+                "staff_dogs": staff_count,
             })
-
-    st.subheader(f"Today's Drivers ({len(active_drivers_with_dogs)} active)")
-    if active_drivers_with_dogs:
-        st.dataframe(
-            pd.DataFrame(active_drivers_with_dogs),
-            use_container_width=True,
-            hide_index=True,
-        )
 
     # ── Check for missing IDs ──
     all_matrix_ids = set(matrix.keys())
@@ -490,49 +486,101 @@ def main():
             missing_ids.add(d["parking_id"])
 
     if missing_ids:
-        st.warning(f"⚠️ {len(missing_ids)} IDs not found in matrix: {sorted(missing_ids)}. "
-                    "Routes involving these stops may fail.")
+        st.warning(f"⚠️ {len(missing_ids)} IDs not found in matrix: {sorted(missing_ids)}")
 
-    # ── Optimize ──
+    # ── Load snapshot and detect changes ──
+    snapshot = load_snapshot(client, SHEET_NAME)
+    changes = detect_changes(assignments, snapshot)
+
+    # ── Driver checklist ──
+    st.subheader("Select Drivers to Optimize")
+
+    if changes is not None:
+        changed_drivers = set(changes.keys())
+        if changed_drivers:
+            changed_active = changed_drivers & set(d["name"] for d in active_drivers_with_dogs)
+            if changed_active:
+                st.info(f"🔄 {len(changed_active)} driver(s) have changes since last optimization")
+        else:
+            st.success("No changes detected since last optimization")
+    else:
+        changed_drivers = set()
+        st.info("No previous optimization found — run all drivers")
+
+    # Select All / Select None / Select Changed
+    btn_col1, btn_col2, btn_col3, btn_col4 = st.columns(4)
+    with btn_col1:
+        if st.button("Select All", use_container_width=True):
+            st.session_state["check_all"] = True
+            st.session_state["check_none"] = False
+    with btn_col2:
+        if st.button("Select None", use_container_width=True):
+            st.session_state["check_none"] = True
+            st.session_state["check_all"] = False
+    with btn_col3:
+        if changes and changed_drivers:
+            if st.button("Select Changed", use_container_width=True):
+                st.session_state["check_changed"] = True
+                st.session_state["check_all"] = False
+                st.session_state["check_none"] = False
+
+    # Determine default state for checkboxes
+    default_all = st.session_state.get("check_all", False)
+    default_none = st.session_state.get("check_none", False)
+    default_changed = st.session_state.get("check_changed", False)
+
+    selected_drivers = []
+    for d in active_drivers_with_dogs:
+        name = d["name"]
+        has_changes = name in changed_drivers
+
+        # Determine default
+        if default_none:
+            default = False
+        elif default_changed:
+            default = has_changes
+        elif default_all or changes is None:
+            default = True
+        else:
+            default = False
+
+        # Build label
+        change_tag = ""
+        if has_changes and changes:
+            c = changes[name]
+            parts = []
+            if c["added"]:
+                parts.append(f"+{len(c['added'])} added")
+            if c["removed"]:
+                parts.append(f"-{len(c['removed'])} removed")
+            change_tag = f"  🔄 {', '.join(parts)}"
+
+        label = f"**{name}** — {d['dogs']} dogs, capacity {d['capacity']}, groups {d['groups']}{change_tag}"
+
+        if st.checkbox(label, value=default, key=f"driver_{name}"):
+            selected_drivers.append(name)
+
+    # ── Optimize button ──
     st.markdown("---")
 
-    # Driver selection
-    all_driver_names = sorted([d["Driver"] for d in active_drivers_with_dogs])
-    
-    col_select1, col_select2 = st.columns([1, 1])
-    with col_select1:
-        select_all = st.checkbox("Select all drivers", value=True)
-    
-    if select_all:
-        selected_drivers = all_driver_names
-    else:
-        selected_drivers = st.multiselect(
-            "Select drivers to optimize:",
-            all_driver_names,
-            default=[]
-        )
-
-    col1, col2 = st.columns([1, 3])
-    with col1:
+    if selected_drivers:
         optimize_btn = st.button(
             f"🚀 Optimize {len(selected_drivers)} Driver{'s' if len(selected_drivers) != 1 else ''}",
             type="primary",
             use_container_width=True,
-            disabled=len(selected_drivers) == 0
         )
+    else:
+        st.write("Select at least one driver to optimize.")
+        optimize_btn = False
 
     if optimize_btn:
         all_results = []
         errors = []
         progress = st.progress(0, text="Starting...")
 
-        driver_list = [d for d in sorted(active_drivers_with_dogs, key=lambda x: x["Driver"])
-                       if d["Driver"] in selected_drivers]
-
-        # Prepare all driver jobs
+        # Prepare jobs
         driver_jobs = []
-        for driver_info in driver_list:
-            name = driver_info["Driver"]
+        for name in selected_drivers:
             config = drivers[name]
             dogs = [a for a in assignments if a["driver"] == name
                     and a["pickup_group"] in config["groups"]]
@@ -542,7 +590,6 @@ def main():
         from concurrent.futures import ProcessPoolExecutor, as_completed
         import multiprocessing
 
-        # Use up to 4 workers (Streamlit Cloud typically has 2-4 cores)
         n_workers = min(4, multiprocessing.cpu_count(), len(driver_jobs))
 
         completed = 0
@@ -555,8 +602,8 @@ def main():
                 name = futures[future]
                 completed += 1
                 progress.progress(
-                    completed / len(driver_list),
-                    text=f"Solved {name} ({completed}/{len(driver_list)})..."
+                    completed / len(driver_jobs),
+                    text=f"Solved {name} ({completed}/{len(driver_jobs)})..."
                 )
                 try:
                     results = future.result()
@@ -567,40 +614,35 @@ def main():
         progress.progress(1.0, text="Done!")
         st.session_state["results"] = all_results
         st.session_state["errors"] = errors
-        st.session_state["selected_drivers_for_validation"] = selected_drivers
+        st.session_state["optimized_drivers"] = selected_drivers
 
-    # ── Display results ──
+    # ── Validation & write ──
     if "results" in st.session_state and st.session_state["results"]:
         results = st.session_state["results"]
         errors = st.session_state.get("errors", [])
-        validated_drivers = st.session_state.get("selected_drivers_for_validation", [])
+        optimized_drivers = st.session_state.get("optimized_drivers", [])
 
         if errors:
             st.error(f"Errors on {len(errors)} drivers: {errors}")
 
-        # ── VALIDATION: Check for missing stops ──
+        # Validation
         validation_issues = []
-        for driver_name in validated_drivers:
+        for driver_name in optimized_drivers:
             if driver_name not in drivers:
                 continue
-            config = drivers[driver_name]
-            
-            # Expected: all non-staff dogs assigned to this driver
+
             expected_dogs = [
                 a for a in assignments
-                if a["driver"] == driver_name
-                and not a["is_staff_dog"]
+                if a["driver"] == driver_name and not a["is_staff_dog"]
             ]
             expected_ids = set(a["customer_id"] for a in expected_dogs)
-            
-            # Actual: all customer stops in the results (exclude field/parking)
+
             driver_results = [r for r in results if r["Driver"] == driver_name]
             routed_ids = set(
                 r["Customer ID"] for r in driver_results
                 if r["Action"] in ("PICK UP", "DROP OFF")
             )
-            
-            # Check for missing pickups
+
             missing_from_route = expected_ids - routed_ids
             if missing_from_route:
                 for mid in missing_from_route:
@@ -608,79 +650,47 @@ def main():
                     reason = "not in matrix" if mid not in matrix else "unknown"
                     validation_issues.append({
                         "Driver": driver_name,
-                        "Missing Customer ID": mid,
+                        "Missing ID": mid,
                         "Dog Name": dog_info.get("dog_name", "?"),
                         "Address": dog_info.get("address", "?"),
                         "Reason": reason,
                     })
-            
-            # Check each dog appears in both a pickup AND a dropoff
-            pickup_ids = set(
-                r["Customer ID"] for r in driver_results
-                if r["Action"] == "PICK UP"
-            )
-            dropoff_ids = set(
-                r["Customer ID"] for r in driver_results
-                if r["Action"] == "DROP OFF"
-            )
-            picked_not_dropped = pickup_ids - dropoff_ids
-            dropped_not_picked = dropoff_ids - pickup_ids
-            
-            for mid in picked_not_dropped:
+
+            pickup_ids = set(r["Customer ID"] for r in driver_results if r["Action"] == "PICK UP")
+            dropoff_ids = set(r["Customer ID"] for r in driver_results if r["Action"] == "DROP OFF")
+
+            for mid in pickup_ids - dropoff_ids:
                 dog_info = next((a for a in expected_dogs if a["customer_id"] == mid), {})
                 validation_issues.append({
-                    "Driver": driver_name,
-                    "Missing Customer ID": mid,
+                    "Driver": driver_name, "Missing ID": mid,
                     "Dog Name": dog_info.get("dog_name", "?"),
                     "Address": dog_info.get("address", "?"),
                     "Reason": "picked up but never dropped off",
                 })
-            for mid in dropped_not_picked:
+            for mid in dropoff_ids - pickup_ids:
                 dog_info = next((a for a in expected_dogs if a["customer_id"] == mid), {})
                 validation_issues.append({
-                    "Driver": driver_name,
-                    "Missing Customer ID": mid,
+                    "Driver": driver_name, "Missing ID": mid,
                     "Dog Name": dog_info.get("dog_name", "?"),
                     "Address": dog_info.get("address", "?"),
                     "Reason": "dropped off but never picked up",
                 })
 
         if validation_issues:
-            st.error(f"🚨 {len(validation_issues)} MISSING STOPS DETECTED:")
-            st.dataframe(
-                pd.DataFrame(validation_issues),
-                use_container_width=True,
-                hide_index=True,
-            )
+            st.error(f"🚨 {len(validation_issues)} MISSING STOPS:")
+            st.dataframe(pd.DataFrame(validation_issues), use_container_width=True, hide_index=True)
         else:
-            st.success("✅ All dogs accounted for — every pickup has a dropoff.")
+            st.success(f"✅ All dogs accounted for across {len(optimized_drivers)} drivers.")
 
-        st.subheader(f"Optimized Routes ({len(results)} total stops)")
-
-        # Driver selector
-        result_drivers = sorted(set(r["Driver"] for r in results))
-        selected_driver = st.selectbox(
-            "View driver:", ["All Drivers"] + result_drivers
-        )
-
-        if selected_driver == "All Drivers":
-            display_results = results
-        else:
-            display_results = [r for r in results if r["Driver"] == selected_driver]
-
-        df = pd.DataFrame(display_results)
-        st.dataframe(df, use_container_width=True, hide_index=True, height=600)
-
-        # ── Write to Sheet ──
+        # Write to Sheet
         st.markdown("---")
-        write_btn = st.button("📤 Write Routes to Google Sheet", type="secondary")
+        write_btn = st.button("📤 Write Routes to Google Sheet", type="secondary", use_container_width=True)
         if write_btn:
             with st.spinner("Writing to Google Sheet..."):
                 try:
                     count = write_results_to_sheet(client, SHEET_NAME, results)
-                    st.success(
-                        f"✅ Wrote {count} rows to '{OUTPUT_TAB_NAME}' tab in '{SHEET_NAME}'"
-                    )
+                    save_snapshot(client, SHEET_NAME, assignments)
+                    st.success(f"✅ Wrote {count} rows to '{OUTPUT_TAB_NAME}' and saved snapshot.")
                 except Exception as e:
                     st.error(f"Failed to write: {e}")
 
