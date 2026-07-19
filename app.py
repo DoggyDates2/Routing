@@ -326,31 +326,48 @@ def solve_driver(matrix, driver_name, config, dogs):
 # WRITE TO SHEET
 # =============================================================================
 
-def write_results_to_sheet(client, sheet_name, all_results):
+def write_results_to_sheet(client, sheet_name, new_results, optimized_drivers):
+    """Write routes to sheet, merging new results with existing ones for other drivers."""
     sheet = client.open(sheet_name)
+    
+    header = ["Driver", "Leg", "Stop", "Action", "Customer ID",
+              "Dog Name", "Address", "Dogs at Stop", "Dogs on Board", "Assignment", "Drive Min"]
+
+    # Read existing results (if any) and keep rows for drivers NOT being re-optimized
+    existing_rows = []
     try:
-        existing = sheet.worksheet(OUTPUT_TAB_NAME)
-        sheet.del_worksheet(existing)
+        existing_ws = sheet.worksheet(OUTPUT_TAB_NAME)
+        existing_data = existing_ws.get_all_values()
+        
+        # Only merge if the existing tab has the right header
+        if len(existing_data) > 0 and existing_data[0] == header:
+            for row in existing_data[1:]:
+                if len(row) > 0 and row[0] not in optimized_drivers:
+                    existing_rows.append(row)
+        # If header doesn't match, discard everything — fresh start
+        
+        sheet.del_worksheet(existing_ws)
     except gspread.exceptions.WorksheetNotFound:
         pass
 
-    ws = sheet.add_worksheet(title=OUTPUT_TAB_NAME, rows=len(all_results) + 1, cols=11)
-
-    header = ["Driver", "Leg", "Stop", "Action", "Customer ID",
-              "Dog Name", "Address", "Dogs at Stop", "Dogs on Board", "Assignment", "Drive Min"]
-    ws.update(range_name="A1", values=[header])
-
-    rows = []
-    for r in all_results:
-        rows.append([
+    # Build new rows
+    new_rows = []
+    for r in new_results:
+        new_rows.append([
             r["Driver"], r["Leg"], r["Stop"], r["Action"],
             r["Customer ID"], r["Dog Name"], r["Address"],
             r["Dogs at Stop"], r["Dogs on Board"], r.get("Assignment", ""), r["Drive Min"],
         ])
 
-    if rows:
-        ws.update(range_name="A2", values=rows)
-    return len(rows)
+    # Combine: existing (unchanged drivers) + new (re-optimized drivers)
+    all_rows = existing_rows + new_rows
+
+    ws = sheet.add_worksheet(title=OUTPUT_TAB_NAME, rows=len(all_rows) + 1, cols=11)
+    ws.update(range_name="A1", values=[header])
+
+    if all_rows:
+        ws.update(range_name="A2", values=all_rows)
+    return len(all_rows)
 
 
 # =============================================================================
@@ -627,11 +644,25 @@ def main():
         st.session_state["errors"] = errors
         st.session_state["optimized_drivers"] = selected_drivers
 
-    # ── Validation & write ──
+        # Auto-write to Google Sheet and save snapshot
+        with st.spinner("Writing routes to Google Sheet..."):
+            try:
+                count = write_results_to_sheet(client, SHEET_NAME, all_results, selected_drivers)
+                save_snapshot(client, SHEET_NAME, assignments)
+                st.session_state["write_success"] = f"✅ Wrote {count} total rows to '{OUTPUT_TAB_NAME}' (updated {len(selected_drivers)} drivers, kept others)."
+            except Exception as e:
+                st.session_state["write_error"] = f"Failed to write: {e}"
+
+    # ── Results ──
     if "results" in st.session_state and st.session_state["results"]:
         results = st.session_state["results"]
         errors = st.session_state.get("errors", [])
         optimized_drivers = st.session_state.get("optimized_drivers", [])
+
+        if st.session_state.get("write_success"):
+            st.success(st.session_state["write_success"])
+        if st.session_state.get("write_error"):
+            st.error(st.session_state["write_error"])
 
         if errors:
             st.error(f"Errors on {len(errors)} drivers: {errors}")
@@ -699,18 +730,6 @@ def main():
             st.dataframe(pd.DataFrame(validation_issues), use_container_width=True, hide_index=True)
         else:
             st.success(f"✅ All dogs accounted for across {len(optimized_drivers)} drivers.")
-
-        # Write to Sheet
-        st.markdown("---")
-        write_btn = st.button("📤 Write Routes to Google Sheet", type="secondary", use_container_width=True)
-        if write_btn:
-            with st.spinner("Writing to Google Sheet..."):
-                try:
-                    count = write_results_to_sheet(client, SHEET_NAME, results)
-                    save_snapshot(client, SHEET_NAME, assignments)
-                    st.success(f"✅ Wrote {count} rows to '{OUTPUT_TAB_NAME}' and saved snapshot.")
-                except Exception as e:
-                    st.error(f"Failed to write: {e}")
 
 
 if __name__ == "__main__":
