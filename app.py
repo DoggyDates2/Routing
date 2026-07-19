@@ -524,41 +524,52 @@ def main():
                 st.session_state["check_all"] = False
                 st.session_state["check_none"] = False
 
+    # Determine if most drivers changed — if so, just select all
+    if changes is not None and len(active_drivers_with_dogs) > 0:
+        pct_changed = len(changed_drivers & set(d["name"] for d in active_drivers_with_dogs)) / len(active_drivers_with_dogs)
+        mostly_changed = pct_changed >= 0.70
+    else:
+        mostly_changed = False
+
     # Determine default state for checkboxes
     default_all = st.session_state.get("check_all", False)
     default_none = st.session_state.get("check_none", False)
     default_changed = st.session_state.get("check_changed", False)
 
     selected_drivers = []
-    for d in active_drivers_with_dogs:
-        name = d["name"]
-        has_changes = name in changed_drivers
+    
+    # Grid layout — 4 columns
+    n_cols = 4
+    driver_list = active_drivers_with_dogs
+    rows_needed = (len(driver_list) + n_cols - 1) // n_cols
 
-        # Determine default
-        if default_none:
-            default = False
-        elif default_changed:
-            default = has_changes
-        elif default_all or changes is None:
-            default = True
-        else:
-            default = False
+    for row_idx in range(rows_needed):
+        cols = st.columns(n_cols)
+        for col_idx in range(n_cols):
+            d_idx = row_idx * n_cols + col_idx
+            if d_idx >= len(driver_list):
+                break
+            d = driver_list[d_idx]
+            name = d["name"]
+            has_changes = name in changed_drivers
 
-        # Build label
-        change_tag = ""
-        if has_changes and changes:
-            c = changes[name]
-            parts = []
-            if c["added"]:
-                parts.append(f"+{len(c['added'])} added")
-            if c["removed"]:
-                parts.append(f"-{len(c['removed'])} removed")
-            change_tag = f"  🔄 {', '.join(parts)}"
+            # Determine default
+            if default_none:
+                default = False
+            elif default_changed:
+                default = has_changes
+            elif default_all or changes is None or mostly_changed:
+                default = True
+            else:
+                default = has_changes
 
-        label = f"**{name}** — {d['dogs']} dogs, capacity {d['capacity']}, groups {d['groups']}{change_tag}"
+            # Simple label — just name + change indicator
+            change_tag = " 🔄" if has_changes else ""
+            label = f"{name}{change_tag}"
 
-        if st.checkbox(label, value=default, key=f"driver_{name}"):
-            selected_drivers.append(name)
+            with cols[col_idx]:
+                if st.checkbox(label, value=default, key=f"driver_{name}"):
+                    selected_drivers.append(name)
 
     # ── Optimize button ──
     st.markdown("---")
@@ -647,12 +658,19 @@ def main():
             if missing_from_route:
                 for mid in missing_from_route:
                     dog_info = next((a for a in expected_dogs if a["customer_id"] == mid), {})
-                    reason = "not in matrix" if mid not in matrix else "unknown"
+                    config = drivers[driver_name]
+                    if mid not in matrix:
+                        reason = "not in matrix"
+                    elif dog_info.get("pickup_group") not in config["groups"]:
+                        reason = f"group {dog_info.get('pickup_group')} not in driver's groups {config['groups']} — check Staff tab"
+                    else:
+                        reason = "unknown"
                     validation_issues.append({
                         "Driver": driver_name,
                         "Missing ID": mid,
                         "Dog Name": dog_info.get("dog_name", "?"),
                         "Address": dog_info.get("address", "?"),
+                        "Assignment": dog_info.get("raw", "?"),
                         "Reason": reason,
                     })
 
