@@ -745,7 +745,8 @@ def main():
         else:
             st.success(f"✅ All dogs accounted for across {len(optimized_drivers)} drivers.")
 
-        # Outlier check — only flag long gaps between dog stops (not to/from field or parking)
+        # Outlier check — only flag long gaps between dog stops in the middle of a leg
+        # Skip first/last dog stops since they're near field or parking
         outliers = []
         for i in range(len(results) - 1):
             r = results[i]
@@ -754,6 +755,13 @@ def main():
                 and r["Min to Next"] > 10
                 and r["Action"] in ("PICK UP", "DROP OFF")
                 and nxt["Action"] in ("PICK UP", "DROP OFF")):
+                # Check if this is an edge stop (first or last dog in the leg)
+                prev_action = results[i - 1]["Action"] if i > 0 else ""
+                next_next_action = results[i + 2]["Action"] if i + 2 < len(results) else ""
+                if prev_action in ("START", "LEAVE", "LEAVE FIELD"):
+                    continue
+                if next_next_action in ("ARRIVE", "ARRIVE FIELD"):
+                    continue
                 outliers.append({
                     "Driver": r["Driver"],
                     "Leg": r["Leg"],
