@@ -529,18 +529,20 @@ def main():
     btn_col1, btn_col2, btn_col3, btn_col4 = st.columns(4)
     with btn_col1:
         if st.button("Select All", use_container_width=True):
-            st.session_state["check_all"] = True
-            st.session_state["check_none"] = False
+            for d in active_drivers_with_dogs:
+                st.session_state[f"driver_{d['name']}"] = True
+            st.rerun()
     with btn_col2:
         if st.button("Select None", use_container_width=True):
-            st.session_state["check_none"] = True
-            st.session_state["check_all"] = False
+            for d in active_drivers_with_dogs:
+                st.session_state[f"driver_{d['name']}"] = False
+            st.rerun()
     with btn_col3:
         if changes and changed_drivers:
             if st.button("Select Changed", use_container_width=True):
-                st.session_state["check_changed"] = True
-                st.session_state["check_all"] = False
-                st.session_state["check_none"] = False
+                for d in active_drivers_with_dogs:
+                    st.session_state[f"driver_{d['name']}"] = d["name"] in changed_drivers
+                st.rerun()
 
     # Determine if most drivers changed — if so, just select all
     if changes is not None and len(active_drivers_with_dogs) > 0:
@@ -548,11 +550,6 @@ def main():
         mostly_changed = pct_changed >= 0.70
     else:
         mostly_changed = False
-
-    # Determine default state for checkboxes
-    default_all = st.session_state.get("check_all", False)
-    default_none = st.session_state.get("check_none", False)
-    default_changed = st.session_state.get("check_changed", False)
 
     selected_drivers = []
     
@@ -571,22 +568,19 @@ def main():
             name = d["name"]
             has_changes = name in changed_drivers
 
-            # Determine default
-            if default_none:
-                default = False
-            elif default_changed:
-                default = has_changes
-            elif default_all or changes is None or mostly_changed:
-                default = True
-            else:
-                default = has_changes
+            # Default: on first load, select changed drivers (or all if no snapshot)
+            if f"driver_{name}" not in st.session_state:
+                if changes is None or mostly_changed:
+                    st.session_state[f"driver_{name}"] = True
+                else:
+                    st.session_state[f"driver_{name}"] = has_changes
 
             # Simple label — just name + change indicator
             change_tag = " 🔄" if has_changes else ""
             label = f"{name}{change_tag}"
 
             with cols[col_idx]:
-                if st.checkbox(label, value=default, key=f"driver_{name}"):
+                if st.checkbox(label, key=f"driver_{name}"):
                     selected_drivers.append(name)
 
     # ── Optimize button ──
