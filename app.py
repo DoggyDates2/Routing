@@ -331,7 +331,7 @@ def write_results_to_sheet(client, sheet_name, new_results, optimized_drivers):
     sheet = client.open(sheet_name)
     
     header = ["Driver", "Leg", "Stop", "Action", "Customer ID",
-              "Dog Name", "Address", "Dogs at Stop", "Dogs on Board", "Assignment", "Drive Min"]
+              "Dog Name", "Address", "Dogs at Stop", "Dogs on Board", "Assignment", "Min to Next", "Drive Min"]
 
     # Read existing results (if any) and keep rows for drivers NOT being re-optimized
     existing_rows = []
@@ -356,13 +356,14 @@ def write_results_to_sheet(client, sheet_name, new_results, optimized_drivers):
         new_rows.append([
             r["Driver"], r["Leg"], r["Stop"], r["Action"],
             r["Customer ID"], r["Dog Name"], r["Address"],
-            r["Dogs at Stop"], r["Dogs on Board"], r.get("Assignment", ""), r["Drive Min"],
+            r["Dogs at Stop"], r["Dogs on Board"], r.get("Assignment", ""),
+            r.get("Min to Next", ""), r["Drive Min"],
         ])
 
     # Combine: existing (unchanged drivers) + new (re-optimized drivers)
     all_rows = existing_rows + new_rows
 
-    ws = sheet.add_worksheet(title=OUTPUT_TAB_NAME, rows=len(all_rows) + 1, cols=11)
+    ws = sheet.add_worksheet(title=OUTPUT_TAB_NAME, rows=len(all_rows) + 1, cols=12)
     ws.update(range_name="A1", values=[header])
 
     if all_rows:
@@ -640,6 +641,25 @@ def main():
                     errors.append(f"{name}: {str(e)}")
 
         progress.progress(1.0, text="Done!")
+
+        # Add "Min to Next" column — drive time from each stop to the next
+        OUTLIER_THRESHOLD = 10  # minutes — flag anything above this
+        for i in range(len(all_results) - 1):
+            curr = all_results[i]
+            nxt = all_results[i + 1]
+            # Only calculate within same driver and same leg
+            if curr["Driver"] == nxt["Driver"] and curr["Leg"] == nxt["Leg"]:
+                from_id = curr["Customer ID"]
+                to_id = nxt["Customer ID"]
+                if from_id in matrix and to_id in matrix.get(from_id, {}):
+                    mins = round(matrix[from_id][to_id], 1)
+                    all_results[i]["Min to Next"] = mins
+                else:
+                    all_results[i]["Min to Next"] = ""
+            else:
+                all_results[i]["Min to Next"] = ""
+        all_results[-1]["Min to Next"] = ""  # last stop has no next
+
         st.session_state["results"] = all_results
         st.session_state["errors"] = errors
         st.session_state["optimized_drivers"] = selected_drivers
@@ -730,6 +750,21 @@ def main():
             st.dataframe(pd.DataFrame(validation_issues), use_container_width=True, hide_index=True)
         else:
             st.success(f"✅ All dogs accounted for across {len(optimized_drivers)} drivers.")
+
+        # Outlier check — flag stops more than 10 min apart
+        outliers = []
+        for r in results:
+            if r.get("Min to Next") and r["Min to Next"] != "" and r["Min to Next"] > 10:
+                outliers.append({
+                    "Driver": r["Driver"],
+                    "Leg": r["Leg"],
+                    "From": r["Dog Name"],
+                    "From Address": r["Address"],
+                    "Min to Next": r["Min to Next"],
+                })
+        if outliers:
+            st.warning(f"⚠️ {len(outliers)} long gaps between stops (over 10 min):")
+            st.dataframe(pd.DataFrame(outliers), use_container_width=True, hide_index=True)
 
 
 if __name__ == "__main__":
