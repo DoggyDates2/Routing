@@ -1,0 +1,31 @@
+name: Update Matrix
+
+on:
+  schedule:
+    # 2am EDT = 6am UTC, 11am EDT = 3pm UTC
+    - cron: '0 6 * * *'
+    - cron: '0 15 * * *'
+  workflow_dispatch:  # Allow manual trigger from GitHub
+
+jobs:
+  update-matrix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install gspread google-auth google-api-python-client requests
+
+      - name: Run matrix update
+        env:
+          GCP_SERVICE_ACCOUNT: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          SCHEDULE_SHEET_ID: ${{ secrets.SCHEDULE_SHEET_ID }}
+          MATRIX_FILE_NAME: ${{ secrets.MATRIX_FILE_NAME }}
+          ORS_API_KEY: ${{ secrets.ORS_API_KEY }}
+        run: python update_matrix.py
