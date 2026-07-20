@@ -1065,6 +1065,7 @@ def main():
 
         # Outlier check — only flag long gaps between dog stops in the middle of a leg
         # Skip first/last dog stops since they're near field or parking
+        # Skip if the "far" dog is within 5 min of its next stop (it's in a cluster)
         outliers = []
         for i in range(len(results) - 1):
             r = results[i]
@@ -1080,6 +1081,10 @@ def main():
                     continue
                 if next_next_action in ("ARRIVE", "ARRIVE FIELD"):
                     continue
+                # Check if the "to" dog is close to its next stop
+                nxt_min = nxt.get("Min to Next", "")
+                if nxt_min != "" and nxt_min <= 5:
+                    continue  # dog is in a cluster, just far from previous stop
                 outliers.append({
                     "Driver": r["Driver"],
                     "Leg": r["Leg"],
@@ -1088,7 +1093,7 @@ def main():
                     "Min Between": r["Min to Next"],
                 })
         if outliers:
-            st.warning(f"⚠️ {len(outliers)} long gaps between stops (over 10 min):")
+            st.warning(f"⚠️ {len(outliers)} long gaps between stops (over 15 min):")
             st.dataframe(pd.DataFrame(outliers), use_container_width=True, hide_index=True)
 
         # Capacity warning — flag drivers who exceed their nominal capacity
