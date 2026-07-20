@@ -668,9 +668,13 @@ def auto_add_to_matrix(client, matrix, missing_dogs, schedule_data):
 
     media = MediaIoBaseUpload(
         io.BytesIO(output.getvalue().encode("utf-8")),
-        mimetype="text/csv"
+        mimetype="text/csv",
+        resumable=True
     )
-    drive.files().update(fileId=file_id, media_body=media).execute()
+    request = drive.files().update(fileId=file_id, media_body=media)
+    response = None
+    while response is None:
+        _, response = request.next_chunk()
 
     st.success(f"✅ Added {total} dog(s) to matrix automatically.")
     return matrix
