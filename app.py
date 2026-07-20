@@ -108,16 +108,43 @@ def load_schedule_sheet(client, sheet_id):
 
 
 def get_available_dates(schedule_data):
-    """Read row 1 of Schedule tab and return available dates from columns K onward."""
+    """Read row 1 of Schedule tab and return future dates from columns K onward."""
+    from datetime import datetime, date
+    
     if not schedule_data:
         return {}
     header_row = schedule_data[0]
-    # Columns K (index 10) through BA (index 52)
+    today = date.today()
+    
     dates = {}
     for col_idx in range(10, min(len(header_row), 53)):
         date_val = header_row[col_idx].strip()
-        if date_val:
-            dates[date_val] = col_idx
+        if not date_val:
+            continue
+        
+        # Try to parse the date
+        parsed = None
+        for fmt in ("%m/%d/%Y", "%m/%d/%y", "%m/%d", "%Y-%m-%d", "%b %d", "%B %d", "%b %d, %Y", "%B %d, %Y"):
+            try:
+                parsed = datetime.strptime(date_val, fmt).date()
+                # If no year in format, assume current year
+                if parsed.year == 1900:
+                    parsed = parsed.replace(year=today.year)
+                break
+            except ValueError:
+                continue
+        
+        if parsed is None:
+            continue
+        
+        # Only include today and future
+        if parsed < today:
+            continue
+        
+        # Format nicely: "Monday July 20"
+        display = parsed.strftime("%A %B %-d")
+        dates[display] = {"col_idx": col_idx, "raw": date_val}
+    
     return dates
 
 
@@ -238,6 +265,7 @@ def solve_driver(matrix, driver_name, config, dogs):
                 continue
 
             stop_ids = [d["customer_id"] for d in pickup_dogs]
+            total_dogs = sum(d["dog_count"] for d in pickup_dogs)
             result = solve_simple_trip(matrix, stop_ids, parking, field)
 
             if result:
@@ -257,6 +285,14 @@ def solve_driver(matrix, driver_name, config, dogs):
                         "Dogs on Board": "", "Assignment": d.get("raw", ""),
                         "Drive Min": round(dist, 1) if loc_id == field else "",
                     })
+            else:
+                results.append({
+                    "Driver": driver_name, "Leg": leg_num + 1, "Stop": 0,
+                    "Action": "⚠️ FAILED", "Customer ID": "",
+                    "Dog Name": f"Leg FAILED: {len(pickup_dogs)} stops, {total_dogs} dogs, capacity {capacity}",
+                    "Address": "", "Dogs at Stop": "", "Dogs on Board": "",
+                    "Assignment": "", "Drive Min": "",
+                })
 
         elif leg_num < len(groups):
             prev_group = groups[leg_num - 1]
@@ -285,6 +321,7 @@ def solve_driver(matrix, driver_name, config, dogs):
             )
 
             dogs_being_dropped = sum(cnt for _, cnt in dropoffs)
+            dogs_being_picked = sum(cnt for _, cnt in pickups)
             initial_load = dogs_being_dropped + staying_customer + staying_staff
 
             if not dropoffs and not pickups:
@@ -311,6 +348,14 @@ def solve_driver(matrix, driver_name, config, dogs):
                         "Dogs on Board": load, "Assignment": d.get("raw", ""),
                         "Drive Min": round(dist, 1) if action_raw == "ARRIVE FIELD" else "",
                     })
+            else:
+                results.append({
+                    "Driver": driver_name, "Leg": leg_num + 1, "Stop": 0,
+                    "Action": "⚠️ FAILED", "Customer ID": "",
+                    "Dog Name": f"Interleaved leg FAILED: drop {len(dropoffs)} ({dogs_being_dropped} dogs) + pick {len(pickups)} ({dogs_being_picked} dogs) + {staying_customer + staying_staff} staying = {initial_load} initial load, capacity {capacity}",
+                    "Address": "", "Dogs at Stop": "", "Dogs on Board": "",
+                    "Assignment": "", "Drive Min": "",
+                })
 
         else:
             last_group = groups[-1]
@@ -508,11 +553,11 @@ def main():
     available_dates = get_available_dates(schedule_data)
 
     if not available_dates:
-        st.error("No dates found in row 1 of the Schedule tab.")
+        st.error("No dates found for today or later in the Schedule tab.")
         st.stop()
 
     selected_date = st.selectbox("Select date:", list(available_dates.keys()))
-    date_col_idx = available_dates[selected_date]
+    date_col_idx = available_dates[selected_date]["col_idx"]
 
     assignments = parse_schedule(schedule_data, date_col_idx)
 
