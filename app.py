@@ -609,7 +609,7 @@ def auto_add_to_matrix(client, matrix, missing_dogs, schedule_data):
                 nearby_coords.append(ecoord)
             else:
                 dist = haversine_miles(new_coords["lat"], new_coords["lng"], ecoord[1], ecoord[0])
-                if dist <= 10:
+                if dist <= 5:
                     nearby_ids.append(eid)
                     nearby_coords.append(ecoord)
 
@@ -810,9 +810,10 @@ def main():
         st.warning(f"⚠️ {len(missing_fields_parking)} field/parking IDs not in matrix: {sorted(missing_fields_parking)}. These need to be added manually.")
 
     if missing_dogs:
-        st.info(f"🐕 {len(missing_dogs)} new dog(s) found — adding to matrix automatically...")
-        matrix = auto_add_to_matrix(client, matrix, missing_dogs, schedule_data)
-        all_matrix_ids = set(matrix.keys())
+        st.warning(f"⚠️ {len(missing_dogs)} new dog(s) not in matrix: {', '.join(missing_dogs.keys())}")
+        if st.button(f"➕ Add {len(missing_dogs)} dog(s) to matrix now", type="secondary"):
+            matrix = auto_add_to_matrix(client, matrix, missing_dogs, schedule_data)
+            all_matrix_ids = set(matrix.keys())
 
     # ── Load snapshot and detect changes ──
     snapshot = load_snapshot(client, SHEET_NAME)
