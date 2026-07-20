@@ -5,6 +5,7 @@ on:
     # 2am EDT = 6am UTC, 11am EDT = 3pm UTC
     - cron: '0 6 * * *'
     - cron: '0 15 * * *'
+    - cron: '0 18 * * *'
   workflow_dispatch:  # Allow manual trigger from GitHub
 
 jobs:
