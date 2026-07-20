@@ -205,7 +205,6 @@ def parse_staff(data):
             continue
         name = row[0].strip()
         status = row[1].strip()
-        notes = row[5].strip()
         field_id = row[6].strip()
         parking_id = row[7].strip()
         capacity_str = row[8].strip()
@@ -215,23 +214,21 @@ def parse_staff(data):
 
         capacity = int(capacity_str)
 
-        if status == "10AM START" and notes == "NO THIRD":
-            groups = [2]
-        elif status == "10AM START":
-            groups = [2, 3]
-        elif notes == "NO THIRD":
-            groups = [1, 2]
-        else:
-            groups = [1, 2, 3]
-
         drivers[name] = {
             "field_id": field_id,
             "parking_id": parking_id,
             "capacity": capacity,
-            "groups": groups,
             "field_address": row[2].strip() if len(row) > 2 else "",
             "parking_address": row[4].strip() if len(row) > 4 else "",
         }
+    return drivers
+
+
+def derive_groups(assignments, driver_name):
+    """Determine a driver's groups from actual assignments in the Schedule tab."""
+    driver_dogs = [a for a in assignments if a["driver"] == driver_name]
+    pickup_groups = set(a["pickup_group"] for a in driver_dogs)
+    return sorted(pickup_groups)
     return drivers
 
 
@@ -330,6 +327,12 @@ def solve_driver(matrix, driver_name, config, dogs):
             result = solve_interleaved_trip(
                 matrix, dropoffs, pickups, field, field, capacity, initial_load
             )
+
+            # If capacity is too tight, retry with relaxed limit
+            if result is None:
+                result = solve_interleaved_trip(
+                    matrix, dropoffs, pickups, field, field, capacity + 4, initial_load
+                )
 
             if result:
                 route, dist = result
@@ -568,9 +571,10 @@ def main():
     active_drivers_with_dogs = []
     for name in sorted(drivers.keys()):
         config = drivers[name]
-        dogs = [a for a in assignments if a["driver"] == name
-                and a["pickup_group"] in config["groups"]]
-        if dogs:
+        # Derive groups from actual assignments, not Staff tab
+        config["groups"] = derive_groups(assignments, name)
+        dogs = [a for a in assignments if a["driver"] == name]
+        if dogs and config["groups"]:
             dog_count = sum(d["dog_count"] for d in dogs)
             staff_count = sum(d["dog_count"] for d in dogs if d["is_staff_dog"])
             active_drivers_with_dogs.append({
@@ -695,8 +699,7 @@ def main():
         driver_jobs = []
         for name in selected_drivers:
             config = drivers[name]
-            dogs = [a for a in assignments if a["driver"] == name
-                    and a["pickup_group"] in config["groups"]]
+            dogs = [a for a in assignments if a["driver"] == name]
             driver_jobs.append((matrix, name, config, dogs))
 
         # Solve in parallel
@@ -796,8 +799,6 @@ def main():
                     config = drivers[driver_name]
                     if mid not in matrix:
                         reason = "not in matrix"
-                    elif dog_info.get("pickup_group") not in config["groups"]:
-                        reason = f"group {dog_info.get('pickup_group')} not in driver's groups {config['groups']} — check Staff tab"
                     else:
                         reason = "unknown"
                     validation_issues.append({
@@ -862,6 +863,29 @@ def main():
         if outliers:
             st.warning(f"⚠️ {len(outliers)} long gaps between stops (over 10 min):")
             st.dataframe(pd.DataFrame(outliers), use_container_width=True, hide_index=True)
+
+        # Capacity warning — flag drivers who exceed their nominal capacity
+        over_capacity = []
+        for driver_name in optimized_drivers:
+            if driver_name not in drivers:
+                continue
+            cap = drivers[driver_name]["capacity"]
+            driver_results = [r for r in results if r["Driver"] == driver_name]
+            max_load = 0
+            for r in driver_results:
+                load = r.get("Dogs on Board", "")
+                if load != "" and isinstance(load, (int, float)):
+                    max_load = max(max_load, load)
+            if max_load > cap:
+                over_capacity.append({
+                    "Driver": driver_name,
+                    "Capacity": cap,
+                    "Max Dogs on Board": int(max_load),
+                    "Over By": int(max_load - cap),
+                })
+        if over_capacity:
+            st.warning(f"🐕 {len(over_capacity)} driver(s) over capacity:")
+            st.dataframe(pd.DataFrame(over_capacity), use_container_width=True, hide_index=True)
 
 
 if __name__ == "__main__":
