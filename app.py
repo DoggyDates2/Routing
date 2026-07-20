@@ -101,10 +101,70 @@ def load_staff_from_sheet(client, sheet_name):
     return ws.get_all_values()
 
 
-def load_today_from_sheet(client, sheet_name):
-    sheet = client.open(sheet_name)
-    ws = sheet.worksheet("Today")
+def load_schedule_sheet(client, sheet_id):
+    sheet = client.open_by_key(sheet_id)
+    ws = sheet.worksheet("Schedule")
     return ws.get_all_values()
+
+
+def get_available_dates(schedule_data):
+    """Read row 1 of Schedule tab and return available dates from columns K onward."""
+    if not schedule_data:
+        return {}
+    header_row = schedule_data[0]
+    # Columns K (index 10) through BA (index 52)
+    dates = {}
+    for col_idx in range(10, min(len(header_row), 53)):
+        date_val = header_row[col_idx].strip()
+        if date_val:
+            dates[date_val] = col_idx
+    return dates
+
+
+def parse_schedule(schedule_data, date_col_idx):
+    """Parse the Schedule tab for a specific date column."""
+    assignments = []
+    for row in schedule_data[1:]:
+        if len(row) <= date_col_idx:
+            continue
+
+        customer_id = row[6].strip() if len(row) > 6 else ""
+        email = row[4].strip() if len(row) > 4 else ""
+        assignment_str = row[date_col_idx].strip() if len(row) > date_col_idx else ""
+        # Dog count is in column BH (index 59)
+        dog_count = int(row[59].strip()) if len(row) > 59 and row[59].strip() else 1
+        dog_name = row[1].strip() if len(row) > 1 else ""
+        address = row[0].strip()
+
+        if not customer_id or not assignment_str:
+            continue
+
+        # Skip cancelled dogs
+        if "cancel" in assignment_str.lower():
+            continue
+
+        if ":" not in assignment_str:
+            continue
+
+        parts = assignment_str.split(":")
+        driver_name = parts[0].strip()
+        code = parts[1].strip() if len(parts) > 1 else ""
+        digits = re.findall(r"\d", code)
+        if not digits:
+            continue
+
+        assignments.append({
+            "customer_id": customer_id,
+            "driver": driver_name,
+            "pickup_group": int(digits[0]),
+            "dropoff_group": int(digits[-1]),
+            "dog_count": dog_count,
+            "is_staff_dog": (email == ""),
+            "dog_name": dog_name,
+            "address": address,
+            "raw": assignment_str,
+        })
+    return assignments
 
 
 # =============================================================================
@@ -146,43 +206,6 @@ def parse_staff(data):
             "parking_address": row[4].strip() if len(row) > 4 else "",
         }
     return drivers
-
-
-def parse_today(data):
-    assignments = []
-    for row in data[1:]:
-        if len(row) < 11:
-            continue
-
-        customer_id = row[6].strip() if len(row) > 6 else ""
-        email = row[4].strip() if len(row) > 4 else ""
-        assignment_str = row[10].strip() if len(row) > 10 else ""
-        dog_count = int(row[11].strip()) if len(row) > 11 and row[11].strip() else 1
-        dog_name = row[1].strip() if len(row) > 1 else ""
-        address = row[0].strip()
-
-        if not customer_id or ":" not in assignment_str:
-            continue
-
-        parts = assignment_str.split(":")
-        driver_name = parts[0].strip()
-        code = parts[1].strip() if len(parts) > 1 else ""
-        digits = re.findall(r"\d", code)
-        if not digits:
-            continue
-
-        assignments.append({
-            "customer_id": customer_id,
-            "driver": driver_name,
-            "pickup_group": int(digits[0]),
-            "dropoff_group": int(digits[-1]),
-            "dog_count": dog_count,
-            "is_staff_dog": (email == ""),
-            "dog_name": dog_name,
-            "address": address,
-            "raw": assignment_str,
-        })
-    return assignments
 
 
 # =============================================================================
@@ -459,17 +482,39 @@ def main():
     matrix = load_matrix_from_drive(client, MATRIX_FILE_NAME)
     st.sidebar.success(f"Matrix loaded: {len(matrix)} locations")
 
-    # ── Load data from Sheets ──
-    with st.spinner("Reading from Google Sheets..."):
+    # ── Load Staff from Routing sheet ──
+    with st.spinner("Reading Staff data..."):
         try:
             staff_data = load_staff_from_sheet(client, SHEET_NAME)
-            today_data = load_today_from_sheet(client, SHEET_NAME)
         except Exception as e:
-            st.error(f"Could not read sheet '{SHEET_NAME}'. Error: {e}")
+            st.error(f"Could not read Staff tab from '{SHEET_NAME}'. Error: {e}")
             st.stop()
 
     drivers = parse_staff(staff_data)
-    assignments = parse_today(today_data)
+
+    # ── Load Schedule sheet and pick a date ──
+    schedule_sheet_id = st.secrets.get("schedule_sheet_id", "")
+    if not schedule_sheet_id:
+        st.error("No schedule_sheet_id in secrets. Add it to your Streamlit secrets.")
+        st.stop()
+
+    with st.spinner("Reading Schedule data..."):
+        try:
+            schedule_data = load_schedule_sheet(client, schedule_sheet_id)
+        except Exception as e:
+            st.error(f"Could not read Schedule tab. Error: {e}")
+            st.stop()
+
+    available_dates = get_available_dates(schedule_data)
+
+    if not available_dates:
+        st.error("No dates found in row 1 of the Schedule tab.")
+        st.stop()
+
+    selected_date = st.selectbox("Select date:", list(available_dates.keys()))
+    date_col_idx = available_dates[selected_date]
+
+    assignments = parse_schedule(schedule_data, date_col_idx)
 
     st.sidebar.markdown(f"**Active drivers:** {len(drivers)}")
     st.sidebar.markdown(f"**Dog assignments:** {len(assignments)}")
