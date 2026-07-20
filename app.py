@@ -407,17 +407,20 @@ def write_results_to_sheet(client, sheet_name, new_results, optimized_drivers):
               "Dog Name", "Address", "Dogs at Stop", "Dogs on Board", "Assignment", "Min to Next", "Drive Min"]
 
     # Read existing results (if any) and keep rows for drivers NOT being re-optimized
+    # Only merge if this is a small partial re-run (less than half the drivers)
     existing_rows = []
     try:
         existing_ws = sheet.worksheet(OUTPUT_TAB_NAME)
         existing_data = existing_ws.get_all_values()
         
-        # Only merge if the existing tab has the right header
-        if len(existing_data) > 0 and existing_data[0] == header:
+        # Only merge if header matches AND this is a partial re-run
+        if (len(existing_data) > 0
+            and existing_data[0] == header
+            and len(optimized_drivers) < len(set(row[0] for row in existing_data[1:] if row)) / 2):
             for row in existing_data[1:]:
                 if len(row) > 0 and row[0] not in optimized_drivers:
                     existing_rows.append(row)
-        # If header doesn't match, discard everything — fresh start
+        # Otherwise: full run or header mismatch — fresh start
         
         sheet.del_worksheet(existing_ws)
     except gspread.exceptions.WorksheetNotFound:
@@ -1093,7 +1096,7 @@ def main():
                     "Min Between": r["Min to Next"],
                 })
         if outliers:
-            st.warning(f"⚠️ {len(outliers)} long gaps between stops (over 15 min):")
+            st.warning(f"⚠️ {len(outliers)} long gaps between stops (over 10 min):")
             st.dataframe(pd.DataFrame(outliers), use_container_width=True, hide_index=True)
 
         # Capacity warning — flag drivers who exceed their nominal capacity
