@@ -1,0 +1,279 @@
+"""
+update_matrix.py — Standalone script to check for new dogs and add them to the matrix.
+Runs via GitHub Actions on a schedule. No Streamlit dependency.
+"""
+
+import csv
+import io
+import json
+import os
+import re
+import time
+import requests
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
+import gspread
+
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+
+
+def get_credentials():
+    """Load GCP credentials from environment variable."""
+    creds_json = os.environ.get("GCP_SERVICE_ACCOUNT")
+    if not creds_json:
+        raise ValueError("GCP_SERVICE_ACCOUNT environment variable not set")
+    creds_info = json.loads(creds_json)
+    return Credentials.from_service_account_info(creds_info, scopes=SCOPES)
+
+
+def load_matrix_from_drive(creds, matrix_file_name):
+    """Download and parse the matrix CSV from Google Drive."""
+    drive = build("drive", "v3", credentials=creds)
+    file_list = drive.files().list(
+        q=f"name='{matrix_file_name}' and trashed=false",
+        fields="files(id, name)"
+    ).execute().get("files", [])
+
+    if not file_list:
+        raise ValueError(f"Matrix file '{matrix_file_name}' not found in Drive")
+
+    file_id = file_list[0]["id"]
+    print(f"Found matrix: {file_list[0]['name']}")
+
+    req = drive.files().get_media(fileId=file_id)
+    content = io.BytesIO()
+    dl = MediaIoBaseDownload(content, req)
+    done = False
+    while not done:
+        _, done = dl.next_chunk()
+    content.seek(0)
+    text = content.read().decode("utf-8-sig")
+
+    matrix = {}
+    reader = csv.reader(io.StringIO(text))
+    header = next(reader)
+    col_ids = [h.strip().replace("\r", "") for h in header[1:] if h.strip()]
+    for row in reader:
+        rid = row[0].strip().replace("\r", "")
+        if not rid:
+            continue
+        matrix[rid] = {}
+        for i, cid in enumerate(col_ids):
+            if i + 1 >= len(row):
+                break
+            v = row[i + 1].strip().replace("\r", "")
+            if v:
+                matrix[rid][cid] = float(v.replace(",", "."))
+            else:
+                matrix[rid][cid] = 9999
+
+    return matrix, file_id, text
+
+
+def load_schedule(creds, sheet_id):
+    """Load the Schedule tab from Google Sheets."""
+    client = gspread.authorize(creds)
+    sheet = client.open_by_key(sheet_id)
+    ws = sheet.worksheet("Schedule")
+    return ws.get_all_values()
+
+
+def find_missing_dogs(matrix, schedule_data):
+    """Find dogs in the Schedule that aren't in the matrix."""
+    matrix_ids = set(matrix.keys())
+    missing = {}
+
+    # Check ALL date columns for dog IDs that have assignments
+    # We care about any dog that might be scheduled, not just today
+    for row in schedule_data[2:]:  # skip header + sub-header
+        cid = row[6].strip() if len(row) > 6 else ""
+        lat = row[8].strip() if len(row) > 8 else ""
+        lng = row[9].strip() if len(row) > 9 else ""
+
+        if not cid or cid in matrix_ids or cid in missing:
+            continue
+        if not lat or not lng:
+            continue
+
+        # Check if this dog has any assignment in any date column
+        has_assignment = False
+        for col_idx in range(10, min(len(row), 53)):
+            val = row[col_idx].strip()
+            if val and ":" in val and "cancel" not in val.lower():
+                has_assignment = True
+                break
+
+        if has_assignment:
+            try:
+                missing[cid] = {"lat": float(lat), "lng": float(lng)}
+            except ValueError:
+                continue
+
+    return missing
+
+
+def add_dogs_to_matrix(creds, matrix, missing_dogs, schedule_data, file_id, matrix_csv_text, ors_key):
+    """Add missing dogs to the matrix using ORS API and upload to Drive."""
+    # Get coords for existing matrix entries
+    existing_with_coords = {}
+    for row in schedule_data[2:]:
+        cid = row[6].strip() if len(row) > 6 else ""
+        lat = row[8].strip() if len(row) > 8 else ""
+        lng = row[9].strip() if len(row) > 9 else ""
+        if cid in matrix and lat and lng:
+            try:
+                existing_with_coords[cid] = {"lat": float(lat), "lng": float(lng)}
+            except ValueError:
+                continue
+
+    existing_ids = list(existing_with_coords.keys())
+    existing_coords = [[existing_with_coords[eid]["lng"], existing_with_coords[eid]["lat"]]
+                       for eid in existing_ids]
+
+    if not existing_ids:
+        print("No existing dogs have coordinates — cannot compute distances.")
+        return
+
+    # Parse current CSV
+    reader_obj = csv.reader(io.StringIO(matrix_csv_text))
+    all_rows = list(reader_obj)
+    header = all_rows[0]
+    data_rows = all_rows[1:]
+
+    for new_id, new_coords in missing_dogs.items():
+        print(f"  Adding {new_id}...")
+        new_loc = [new_coords["lng"], new_coords["lat"]]
+        new_to_existing = {}
+        existing_to_new = {}
+        batch_size = 25
+
+        for batch_start in range(0, len(existing_ids), batch_size):
+            batch_ids = existing_ids[batch_start:batch_start + batch_size]
+            batch_coords = existing_coords[batch_start:batch_start + batch_size]
+            locations = [new_loc] + batch_coords
+            destinations = list(range(1, len(batch_coords) + 1))
+
+            # New → existing
+            try:
+                resp = requests.post(
+                    "https://api.openrouteservice.org/v2/matrix/driving-car",
+                    headers={"Authorization": ors_key, "Content-Type": "application/json"},
+                    json={"locations": locations, "sources": [0],
+                          "destinations": destinations, "metrics": ["duration"]},
+                    timeout=30
+                )
+                if resp.status_code == 200:
+                    durations = resp.json().get("durations", [[]])[0]
+                    for i, bid in enumerate(batch_ids):
+                        new_to_existing[bid] = round(durations[i] / 60, 1)
+                else:
+                    print(f"    ORS error (new→existing): {resp.status_code}")
+            except Exception as e:
+                print(f"    ORS request failed: {e}")
+            time.sleep(0.5)
+
+            # Existing → new
+            try:
+                resp = requests.post(
+                    "https://api.openrouteservice.org/v2/matrix/driving-car",
+                    headers={"Authorization": ors_key, "Content-Type": "application/json"},
+                    json={"locations": locations, "sources": destinations,
+                          "destinations": [0], "metrics": ["duration"]},
+                    timeout=30
+                )
+                if resp.status_code == 200:
+                    dur_matrix = resp.json().get("durations", [])
+                    for i, bid in enumerate(batch_ids):
+                        existing_to_new[bid] = round(dur_matrix[i][0] / 60, 1)
+                else:
+                    print(f"    ORS error (existing→new): {resp.status_code}")
+            except Exception as e:
+                print(f"    ORS request failed: {e}")
+            time.sleep(0.5)
+
+        # Update CSV
+        header.append(new_id)
+        for row in data_rows:
+            row_id = row[0].strip()
+            row.append(str(existing_to_new.get(row_id, 9999)))
+
+        new_row = [new_id]
+        for col_id in header[1:]:
+            if col_id == new_id:
+                new_row.append("0")
+            else:
+                new_row.append(str(new_to_existing.get(col_id, 9999)))
+        data_rows.append(new_row)
+
+        existing_ids.append(new_id)
+        existing_coords.append(new_loc)
+
+    # Upload updated CSV
+    print("Uploading updated matrix to Drive...")
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(header)
+    for row in data_rows:
+        writer.writerow(row)
+
+    drive = build("drive", "v3", credentials=creds)
+    media = MediaIoBaseUpload(
+        io.BytesIO(output.getvalue().encode("utf-8")),
+        mimetype="text/csv"
+    )
+    drive.files().update(fileId=file_id, media_body=media).execute()
+    print("Done!")
+
+
+def main():
+    print("=" * 50)
+    print("Matrix Update Check")
+    print("=" * 50)
+
+    # Load config from environment
+    matrix_file_name = os.environ.get("MATRIX_FILE_NAME", "matrix.csv")
+    schedule_sheet_id = os.environ.get("SCHEDULE_SHEET_ID", "")
+    ors_key = os.environ.get("ORS_API_KEY", "")
+
+    if not schedule_sheet_id:
+        print("ERROR: SCHEDULE_SHEET_ID not set")
+        return
+    if not ors_key:
+        print("ERROR: ORS_API_KEY not set")
+        return
+
+    # Connect
+    creds = get_credentials()
+
+    # Load matrix
+    print("Loading matrix from Drive...")
+    matrix, file_id, matrix_text = load_matrix_from_drive(creds, matrix_file_name)
+    print(f"Matrix has {len(matrix)} locations")
+
+    # Load schedule
+    print("Loading Schedule tab...")
+    schedule_data = load_schedule(creds, schedule_sheet_id)
+    print(f"Schedule has {len(schedule_data)} rows")
+
+    # Find missing
+    missing = find_missing_dogs(matrix, schedule_data)
+
+    if not missing:
+        print("✅ No new dogs to add. Matrix is up to date.")
+        return
+
+    print(f"⚠️ Found {len(missing)} new dog(s) to add:")
+    for cid, coords in missing.items():
+        print(f"  • {cid} — ({coords['lat']}, {coords['lng']})")
+
+    # Add them
+    add_dogs_to_matrix(creds, matrix, missing, schedule_data, file_id, matrix_text, ors_key)
+    print(f"✅ Successfully added {len(missing)} dog(s) to matrix.")
+
+
+if __name__ == "__main__":
+    main()
