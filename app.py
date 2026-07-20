@@ -510,6 +510,172 @@ def detect_changes(assignments, snapshot):
     return changes
 
 
+def auto_add_to_matrix(client, matrix, missing_dogs, schedule_data):
+    """Automatically add missing dogs to the matrix using ORS API."""
+    import requests
+    import time as _time
+
+    ors_key = st.secrets.get("ors_api_key", "")
+    if not ors_key:
+        st.warning("No ors_api_key in secrets — cannot auto-add dogs.")
+        return matrix
+
+    # Get lat/lngs for existing matrix entries from Schedule
+    existing_with_coords = {}
+    for row in schedule_data[2:]:
+        cid = row[6].strip() if len(row) > 6 else ""
+        lat = row[8].strip() if len(row) > 8 else ""
+        lng = row[9].strip() if len(row) > 9 else ""
+        if cid in matrix and lat and lng:
+            try:
+                existing_with_coords[cid] = {"lat": float(lat), "lng": float(lng)}
+            except ValueError:
+                continue
+
+    existing_ids = list(existing_with_coords.keys())
+    existing_coords = [[existing_with_coords[eid]["lng"], existing_with_coords[eid]["lat"]]
+                       for eid in existing_ids]
+
+    if not existing_ids:
+        st.warning("No existing dogs have coordinates — cannot compute distances.")
+        return matrix
+
+    # Download matrix CSV from Drive
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
+    from google.oauth2.service_account import Credentials as Creds
+
+    creds = Creds.from_service_account_info(
+        st.secrets["gcp_service_account"], scopes=SCOPES
+    )
+    drive = build("drive", "v3", credentials=creds)
+
+    matrix_file_name = st.secrets.get("matrix_file_name", "matrix.csv")
+    file_list = drive.files().list(
+        q=f"name='{matrix_file_name}' and trashed=false",
+        fields="files(id)"
+    ).execute().get("files", [])
+
+    if not file_list:
+        st.warning("Could not find matrix file in Drive.")
+        return matrix
+
+    file_id = file_list[0]["id"]
+
+    req = drive.files().get_media(fileId=file_id)
+    content = io.BytesIO()
+    dl = MediaIoBaseDownload(content, req)
+    done = False
+    while not done:
+        _, done = dl.next_chunk()
+    content.seek(0)
+    matrix_text = content.read().decode("utf-8-sig")
+
+    reader_obj = csv.reader(io.StringIO(matrix_text))
+    all_rows = list(reader_obj)
+    header = all_rows[0]
+    data_rows = all_rows[1:]
+
+    progress = st.progress(0, text="Starting matrix update...")
+    total = len(missing_dogs)
+    completed = 0
+
+    for new_id, new_coords in missing_dogs.items():
+        completed += 1
+        progress.progress(completed / total, text=f"Adding {new_id} ({completed}/{total})...")
+
+        new_loc = [new_coords["lng"], new_coords["lat"]]
+        new_to_existing = {}
+        existing_to_new = {}
+        batch_size = 25
+
+        for batch_start in range(0, len(existing_ids), batch_size):
+            batch_ids = existing_ids[batch_start:batch_start + batch_size]
+            batch_coords = existing_coords[batch_start:batch_start + batch_size]
+            locations = [new_loc] + batch_coords
+            destinations = list(range(1, len(batch_coords) + 1))
+
+            # New → existing
+            try:
+                resp = requests.post(
+                    "https://api.openrouteservice.org/v2/matrix/driving-car",
+                    headers={"Authorization": ors_key, "Content-Type": "application/json"},
+                    json={"locations": locations, "sources": [0],
+                          "destinations": destinations, "metrics": ["duration"]},
+                    timeout=30
+                )
+                if resp.status_code == 200:
+                    durations = resp.json().get("durations", [[]])[0]
+                    for i, bid in enumerate(batch_ids):
+                        new_to_existing[bid] = round(durations[i] / 60, 1)
+            except Exception:
+                pass
+            _time.sleep(0.5)
+
+            # Existing → new
+            try:
+                resp = requests.post(
+                    "https://api.openrouteservice.org/v2/matrix/driving-car",
+                    headers={"Authorization": ors_key, "Content-Type": "application/json"},
+                    json={"locations": locations, "sources": destinations,
+                          "destinations": [0], "metrics": ["duration"]},
+                    timeout=30
+                )
+                if resp.status_code == 200:
+                    dur_matrix = resp.json().get("durations", [])
+                    for i, bid in enumerate(batch_ids):
+                        existing_to_new[bid] = round(dur_matrix[i][0] / 60, 1)
+            except Exception:
+                pass
+            _time.sleep(0.5)
+
+        # Update CSV: add column to header
+        header.append(new_id)
+
+        # Add distance to each existing row
+        for row in data_rows:
+            row_id = row[0].strip()
+            row.append(str(existing_to_new.get(row_id, 9999)))
+
+        # Create new row
+        new_row = [new_id]
+        for col_id in header[1:]:
+            if col_id == new_id:
+                new_row.append("0")
+            else:
+                new_row.append(str(new_to_existing.get(col_id, 9999)))
+        data_rows.append(new_row)
+
+        # Update in-memory matrix
+        matrix[new_id] = {}
+        for cid, dist in new_to_existing.items():
+            matrix[new_id][cid] = dist
+        for cid, dist in existing_to_new.items():
+            if cid in matrix:
+                matrix[cid][new_id] = dist
+
+        # Add to existing lists for subsequent dogs
+        existing_ids.append(new_id)
+        existing_coords.append(new_loc)
+
+    # Upload updated CSV to Drive
+    progress.progress(1.0, text="Uploading updated matrix...")
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(header)
+    for row in data_rows:
+        writer.writerow(row)
+
+    media = MediaIoBaseUpload(
+        io.BytesIO(output.getvalue().encode("utf-8")),
+        mimetype="text/csv"
+    )
+    drive.files().update(fileId=file_id, media_body=media).execute()
+
+    st.success(f"✅ Added {total} dog(s) to matrix automatically.")
+    return matrix
+
+
 # =============================================================================
 # STREAMLIT UI
 # =============================================================================
@@ -585,20 +751,37 @@ def main():
                 "staff_dogs": staff_count,
             })
 
-    # ── Check for missing IDs ──
+    # ── Auto-check for missing dogs and add them ──
     all_matrix_ids = set(matrix.keys())
-    missing_ids = set()
+    missing_dogs = {}
     for a in assignments:
         if a["customer_id"] not in all_matrix_ids and not a["is_staff_dog"]:
-            missing_ids.add(a["customer_id"])
+            # Get lat/lng from schedule
+            for row in schedule_data[2:]:
+                if len(row) > 9 and row[6].strip() == a["customer_id"]:
+                    lat = row[8].strip()
+                    lng = row[9].strip()
+                    if lat and lng:
+                        try:
+                            missing_dogs[a["customer_id"]] = {"lat": float(lat), "lng": float(lng)}
+                        except ValueError:
+                            pass
+                    break
+
+    missing_fields_parking = set()
     for d in drivers.values():
         if d["field_id"] not in all_matrix_ids:
-            missing_ids.add(d["field_id"])
+            missing_fields_parking.add(d["field_id"])
         if d["parking_id"] not in all_matrix_ids:
-            missing_ids.add(d["parking_id"])
+            missing_fields_parking.add(d["parking_id"])
 
-    if missing_ids:
-        st.warning(f"⚠️ {len(missing_ids)} IDs not found in matrix: {sorted(missing_ids)}")
+    if missing_fields_parking:
+        st.warning(f"⚠️ {len(missing_fields_parking)} field/parking IDs not in matrix: {sorted(missing_fields_parking)}. These need to be added manually.")
+
+    if missing_dogs:
+        st.info(f"🐕 {len(missing_dogs)} new dog(s) found — adding to matrix automatically...")
+        matrix = auto_add_to_matrix(client, matrix, missing_dogs, schedule_data)
+        all_matrix_ids = set(matrix.keys())
 
     # ── Load snapshot and detect changes ──
     snapshot = load_snapshot(client, SHEET_NAME)
@@ -886,6 +1069,7 @@ def main():
         if over_capacity:
             st.warning(f"🐕 {len(over_capacity)} driver(s) over capacity:")
             st.dataframe(pd.DataFrame(over_capacity), use_container_width=True, hide_index=True)
+
 
 
 if __name__ == "__main__":
