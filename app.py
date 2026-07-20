@@ -95,14 +95,16 @@ def get_gspread_client():
     return gspread.authorize(creds)
 
 
-def load_staff_from_sheet(client, sheet_name):
-    sheet = client.open(sheet_name)
+@st.cache_data(show_spinner="Loading Staff data...", ttl=300)
+def load_staff_from_sheet(_client, sheet_name):
+    sheet = _client.open(sheet_name)
     ws = sheet.worksheet("Staff")
     return ws.get_all_values()
 
 
-def load_schedule_sheet(client, sheet_id):
-    sheet = client.open_by_key(sheet_id)
+@st.cache_data(show_spinner="Loading Schedule data...", ttl=300)
+def load_schedule_sheet(_client, sheet_id):
+    sheet = _client.open_by_key(sheet_id)
     ws = sheet.worksheet("Schedule")
     return ws.get_all_values()
 
@@ -759,6 +761,15 @@ def main():
     selected_date = st.selectbox("Select date:", list(available_dates.keys()))
     date_col_idx = available_dates[selected_date]["col_idx"]
 
+    # Reset checkboxes when date changes
+    if st.session_state.get("last_date") != selected_date:
+        for key in list(st.session_state.keys()):
+            if key.startswith("driver_"):
+                del st.session_state[key]
+        st.session_state["last_date"] = selected_date
+        st.session_state.pop("results", None)
+        st.session_state.pop("errors", None)
+
     assignments = parse_schedule(schedule_data, date_col_idx)
 
     st.sidebar.markdown(f"**Active drivers:** {len(drivers)}")
@@ -832,9 +843,8 @@ def main():
             st.success("No changes detected since last optimization")
     else:
         changed_drivers = set()
-        st.info("No previous optimization found — run all drivers")
 
-    # Select All / Select None / Select Changed
+    # Select All / Select None / Select Changed + Optimize button on same row
     btn_col1, btn_col2, btn_col3, btn_col4 = st.columns(4)
     with btn_col1:
         if st.button("Select All", use_container_width=True):
@@ -852,6 +862,9 @@ def main():
                 for d in active_drivers_with_dogs:
                     st.session_state[f"driver_{d['name']}"] = d["name"] in changed_drivers
                 st.rerun()
+
+    # Optimize button placeholder — renders here but triggered after checklist
+    optimize_placeholder = st.empty()
 
     # Determine if most drivers changed — if so, just select all
     if changes is not None and len(active_drivers_with_dogs) > 0:
@@ -892,18 +905,17 @@ def main():
                 if st.checkbox(label, key=f"driver_{name}"):
                     selected_drivers.append(name)
 
-    # ── Optimize button ──
-    st.markdown("---")
-
-    if selected_drivers:
-        optimize_btn = st.button(
-            f"🚀 Optimize {len(selected_drivers)} Driver{'s' if len(selected_drivers) != 1 else ''}",
-            type="primary",
-            use_container_width=True,
-        )
-    else:
-        st.write("Select at least one driver to optimize.")
-        optimize_btn = False
+    # Now render the optimize button in the placeholder above the checklist
+    with optimize_placeholder:
+        if selected_drivers:
+            optimize_btn = st.button(
+                f"🚀 Optimize {len(selected_drivers)} Driver{'s' if len(selected_drivers) != 1 else ''}",
+                type="primary",
+                use_container_width=True,
+            )
+        else:
+            st.write("Select at least one driver to optimize.")
+            optimize_btn = False
 
     if optimize_btn:
         all_results = []
