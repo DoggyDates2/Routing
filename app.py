@@ -589,9 +589,36 @@ def auto_add_to_matrix(client, matrix, missing_dogs, schedule_data):
         existing_to_new = {}
         batch_size = 25
 
-        for batch_start in range(0, len(existing_ids), batch_size):
-            batch_ids = existing_ids[batch_start:batch_start + batch_size]
-            batch_coords = existing_coords[batch_start:batch_start + batch_size]
+        # Only compute ORS distances to dogs within 10 miles (haversine pre-filter)
+        import math
+        def haversine_miles(lat1, lon1, lat2, lon2):
+            R = 3959
+            dlat = math.radians(lat2 - lat1)
+            dlon = math.radians(lon2 - lon1)
+            a = (math.sin(dlat/2)**2 +
+                 math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) *
+                 math.sin(dlon/2)**2)
+            return R * 2 * math.asin(math.sqrt(a))
+
+        nearby_ids = []
+        nearby_coords = []
+        for eid, ecoord in zip(existing_ids, existing_coords):
+            # Always include fields (F) and parking (P), filter dogs by distance
+            if eid.endswith("F") or eid.endswith("P"):
+                nearby_ids.append(eid)
+                nearby_coords.append(ecoord)
+            else:
+                dist = haversine_miles(new_coords["lat"], new_coords["lng"], ecoord[1], ecoord[0])
+                if dist <= 10:
+                    nearby_ids.append(eid)
+                    nearby_coords.append(ecoord)
+
+        progress.progress(completed / total,
+            text=f"Adding {new_id} ({completed}/{total}) — {len(nearby_ids)} nearby locations...")
+
+        for batch_start in range(0, len(nearby_ids), batch_size):
+            batch_ids = nearby_ids[batch_start:batch_start + batch_size]
+            batch_coords = nearby_coords[batch_start:batch_start + batch_size]
             locations = [new_loc] + batch_coords
             destinations = list(range(1, len(batch_coords) + 1))
 
