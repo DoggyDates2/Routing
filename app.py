@@ -178,21 +178,40 @@ def parse_schedule(schedule_data, date_col_idx):
         parts = assignment_str.split(":")
         driver_name = parts[0].strip()
         code = parts[1].strip() if len(parts) > 1 else ""
-        digits = re.findall(r"\d", code)
-        if not digits:
-            continue
 
-        assignments.append({
-            "customer_id": customer_id,
-            "driver": driver_name,
-            "pickup_group": int(digits[0]),
-            "dropoff_group": int(digits[-1]),
-            "dog_count": dog_count,
-            "is_staff_dog": (email == ""),
-            "dog_name": dog_name,
-            "address": address,
-            "raw": assignment_str,
-        })
+        # Handle "!" split — dog goes home between groups (e.g., "1!3" = group 1, then group 3 separately)
+        if "!" in code:
+            sub_codes = code.split("!")
+            for sub_code in sub_codes:
+                digits = re.findall(r"\d", sub_code)
+                if not digits:
+                    continue
+                assignments.append({
+                    "customer_id": customer_id,
+                    "driver": driver_name,
+                    "pickup_group": int(digits[0]),
+                    "dropoff_group": int(digits[-1]),
+                    "dog_count": dog_count,
+                    "is_staff_dog": (email == ""),
+                    "dog_name": dog_name,
+                    "address": address,
+                    "raw": assignment_str,
+                })
+        else:
+            digits = re.findall(r"\d", code)
+            if not digits:
+                continue
+            assignments.append({
+                "customer_id": customer_id,
+                "driver": driver_name,
+                "pickup_group": int(digits[0]),
+                "dropoff_group": int(digits[-1]),
+                "dog_count": dog_count,
+                "is_staff_dog": (email == ""),
+                "dog_name": dog_name,
+                "address": address,
+                "raw": assignment_str,
+            })
     return assignments
 
 
