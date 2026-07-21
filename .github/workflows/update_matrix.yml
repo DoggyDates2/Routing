@@ -2,7 +2,7 @@ name: Update Matrix
 
 on:
   schedule:
-    # 2am EDT = 6am UTC, 11am EDT = 3pm UTC
+    # 2am EDT = 6am UTC, 11am EDT = 3pm UTC, 2pm EDT = 6pm UTC
     - cron: '0 6 * * *'
     - cron: '0 15 * * *'
     - cron: '0 18 * * *'
@@ -29,4 +29,5 @@ jobs:
           SCHEDULE_SHEET_ID: ${{ secrets.SCHEDULE_SHEET_ID }}
           MATRIX_FILE_NAME: ${{ secrets.MATRIX_FILE_NAME }}
           ORS_API_KEY: ${{ secrets.ORS_API_KEY }}
+          ROUTING_SHEET_NAME: ${{ secrets.ROUTING_SHEET_NAME }}
         run: python update_matrix.py
