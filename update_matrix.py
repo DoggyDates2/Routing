@@ -130,6 +130,27 @@ def add_dogs_to_matrix(creds, matrix, missing_dogs, schedule_data, file_id, matr
             except ValueError:
                 continue
 
+    # Also load field/parking coordinates from Locations tab
+    try:
+        sheet_name = os.environ.get("ROUTING_SHEET_NAME", "Routing")
+        client = gspread.authorize(creds)
+        loc_sheet = client.open(sheet_name)
+        loc_ws = loc_sheet.worksheet("Locations")
+        loc_data = loc_ws.get_all_values()
+        for row in loc_data[1:]:
+            if len(row) >= 3:
+                loc_id = row[0].strip()
+                lat = row[1].strip()
+                lng = row[2].strip()
+                if loc_id and lat and lng and loc_id in matrix:
+                    try:
+                        existing_with_coords[loc_id] = {"lat": float(lat), "lng": float(lng)}
+                    except ValueError:
+                        continue
+        print(f"  Loaded {sum(1 for k in existing_with_coords if k.endswith('F') or k.endswith('P'))} field/parking coordinates from Locations tab")
+    except Exception as e:
+        print(f"  Warning: could not load Locations tab: {e}")
+
     existing_ids = list(existing_with_coords.keys())
     existing_coords = [[existing_with_coords[eid]["lng"], existing_with_coords[eid]["lat"]]
                        for eid in existing_ids]
@@ -170,7 +191,7 @@ def add_dogs_to_matrix(creds, matrix, missing_dogs, schedule_data, file_id, matr
                 nearby_coords.append(ecoord)
             else:
                 dist = haversine_miles(new_coords["lat"], new_coords["lng"], ecoord[1], ecoord[0])
-                if dist <= 5:
+                if dist <= 7:
                     nearby_ids.append(eid)
                     nearby_coords.append(ecoord)
 
@@ -288,16 +309,170 @@ def main():
     missing = find_missing_dogs(matrix, schedule_data)
 
     if not missing:
-        print("✅ No new dogs to add. Matrix is up to date.")
+        print("✅ No new dogs to add.")
+    else:
+        print(f"⚠️ Found {len(missing)} new dog(s) to add:")
+        for cid, coords in missing.items():
+            print(f"  • {cid} — ({coords['lat']}, {coords['lng']})")
+        add_dogs_to_matrix(creds, matrix, missing, schedule_data, file_id, matrix_text, ors_key)
+        print(f"✅ Added {len(missing)} dog(s).")
+        # Reload matrix after adding
+        matrix, file_id, matrix_text = load_matrix_from_drive(creds, matrix_file_name)
+
+    # ── Fix 9999 entries (batch of 50 pairs per run) ──
+    print("\nChecking for 9999 entries to repair...")
+    repair_9999s(creds, matrix, schedule_data, file_id, matrix_text, ors_key)
+    print("✅ Matrix update complete.")
+
+
+def repair_9999s(creds, matrix, schedule_data, file_id, matrix_text, ors_key):
+    """Find 9999 entries in the matrix and fill them in via ORS. Processes 50 pairs per run."""
+    import math
+
+    # Build coordinate lookup from Schedule + Locations
+    coords_lookup = {}
+    for row in schedule_data[2:]:
+        cid = row[6].strip() if len(row) > 6 else ""
+        lat = row[8].strip() if len(row) > 8 else ""
+        lng = row[9].strip() if len(row) > 9 else ""
+        if cid and lat and lng:
+            try:
+                coords_lookup[cid] = {"lat": float(lat), "lng": float(lng)}
+            except ValueError:
+                continue
+
+    # Load field/parking coords from Locations tab
+    try:
+        sheet_name = os.environ.get("ROUTING_SHEET_NAME", "Routing")
+        client = gspread.authorize(creds)
+        loc_ws = client.open(sheet_name).worksheet("Locations")
+        for row in loc_ws.get_all_values()[1:]:
+            if len(row) >= 3:
+                loc_id = row[0].strip()
+                lat = row[1].strip()
+                lng = row[2].strip()
+                if loc_id and lat and lng:
+                    try:
+                        coords_lookup[loc_id] = {"lat": float(lat), "lng": float(lng)}
+                    except ValueError:
+                        continue
+    except Exception as e:
+        print(f"  Warning: could not load Locations tab: {e}")
+
+    # Find 9999 pairs where we have coordinates for both
+    pairs_to_fix = []
+    for from_id, dests in matrix.items():
+        if from_id not in coords_lookup:
+            continue
+        for to_id, dist in dests.items():
+            if dist >= 9999 and to_id in coords_lookup and from_id != to_id:
+                pairs_to_fix.append((from_id, to_id))
+
+    if not pairs_to_fix:
+        print("  No 9999 entries to repair.")
         return
 
-    print(f"⚠️ Found {len(missing)} new dog(s) to add:")
-    for cid, coords in missing.items():
-        print(f"  • {cid} — ({coords['lat']}, {coords['lng']})")
+    # Limit to 50 pairs per run
+    batch = pairs_to_fix[:50]
+    print(f"  Found {len(pairs_to_fix)} pairs with 9999. Fixing {len(batch)} this run...")
 
-    # Add them
-    add_dogs_to_matrix(creds, matrix, missing, schedule_data, file_id, matrix_text, ors_key)
-    print(f"✅ Successfully added {len(missing)} dog(s) to matrix.")
+    # Parse CSV for editing
+    reader_obj = csv.reader(io.StringIO(matrix_text))
+    all_rows = list(reader_obj)
+    header = all_rows[0]
+    data_rows = all_rows[1:]
+
+    # Build column index lookup
+    col_idx = {}
+    for i, h in enumerate(header):
+        col_idx[h.strip()] = i
+
+    # Build row index lookup
+    row_idx = {}
+    for i, row in enumerate(data_rows):
+        row_idx[row[0].strip()] = i
+
+    # Process pairs via ORS
+    fixed = 0
+    batch_size = 10  # ORS pairs per request
+
+    for i in range(0, len(batch), batch_size):
+        sub_batch = batch[i:i + batch_size]
+
+        for from_id, to_id in sub_batch:
+            from_coords = coords_lookup[from_id]
+            to_coords = coords_lookup[to_id]
+
+            locations = [
+                [from_coords["lng"], from_coords["lat"]],
+                [to_coords["lng"], to_coords["lat"]]
+            ]
+
+            # Forward: from → to
+            try:
+                resp = requests.post(
+                    "https://api.openrouteservice.org/v2/matrix/driving-car",
+                    headers={"Authorization": ors_key, "Content-Type": "application/json"},
+                    json={"locations": locations, "sources": [0],
+                          "destinations": [1], "metrics": ["duration"]},
+                    timeout=30
+                )
+                if resp.status_code == 200:
+                    dur = resp.json().get("durations", [[]])[0][0]
+                    minutes = round(dur / 60, 1)
+
+                    # Update CSV
+                    if from_id in row_idx and to_id in col_idx:
+                        data_rows[row_idx[from_id]][col_idx[to_id]] = str(minutes)
+                        fixed += 1
+            except Exception:
+                pass
+
+            # Reverse: to → from
+            try:
+                resp = requests.post(
+                    "https://api.openrouteservice.org/v2/matrix/driving-car",
+                    headers={"Authorization": ors_key, "Content-Type": "application/json"},
+                    json={"locations": locations, "sources": [1],
+                          "destinations": [0], "metrics": ["duration"]},
+                    timeout=30
+                )
+                if resp.status_code == 200:
+                    dur = resp.json().get("durations", [[]])[0][0]
+                    minutes = round(dur / 60, 1)
+
+                    if to_id in row_idx and from_id in col_idx:
+                        data_rows[row_idx[to_id]][col_idx[from_id]] = str(minutes)
+                        fixed += 1
+            except Exception:
+                pass
+
+            time.sleep(0.5)
+
+    if fixed > 0:
+        print(f"  Fixed {fixed} entries. Uploading...")
+        from googleapiclient.discovery import build
+        from googleapiclient.http import MediaIoBaseUpload
+
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(header)
+        for row in data_rows:
+            writer.writerow(row)
+
+        drive = build("drive", "v3", credentials=creds)
+        media = MediaIoBaseUpload(
+            io.BytesIO(output.getvalue().encode("utf-8")),
+            mimetype="text/csv",
+            resumable=True
+        )
+        request = drive.files().update(fileId=file_id, media_body=media)
+        response = None
+        while response is None:
+            _, response = request.next_chunk()
+        print(f"  Uploaded. {len(pairs_to_fix) - len(batch)} pairs remaining for future runs.")
+    else:
+        print("  No fixes applied this run.")
 
 
 if __name__ == "__main__":
