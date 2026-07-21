@@ -32,7 +32,7 @@ SNAPSHOT_TAB_NAME = "Route Snapshot"
 # DATA LOADING
 # =============================================================================
 
-@st.cache_data(show_spinner="Loading distance matrix from Google Drive...")
+@st.cache_data(show_spinner="Loading distance matrix from Google Drive...", ttl=1800)
 def load_matrix_from_drive(_client, file_name):
     """Download matrix CSV from Google Drive and parse it."""
     from google.oauth2.service_account import Credentials as Creds
