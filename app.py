@@ -940,9 +940,6 @@ def main():
                 else:
                     st.session_state[f"driver_{name}"] = has_changes
 
-    # Mark defaults as applied so they don't reset on every interaction
-    st.session_state[f"defaults_applied_{selected_date}"] = True
-
             # Simple label — just name + change indicator
             change_tag = " 🔄" if has_changes else ""
             label = f"{name}{change_tag}"
@@ -950,6 +947,9 @@ def main():
             with cols[col_idx]:
                 if st.checkbox(label, key=f"driver_{name}"):
                     selected_drivers.append(name)
+
+    # Mark defaults as applied so they don't reset on every interaction
+    st.session_state[f"defaults_applied_{selected_date}"] = True
 
     # Now render the optimize button in the placeholder above the checklist
     with optimize_placeholder:
