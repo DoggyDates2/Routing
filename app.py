@@ -32,7 +32,7 @@ SNAPSHOT_TAB_NAME = "Route Snapshot"
 # DATA LOADING
 # =============================================================================
 
-@st.cache_data(show_spinner="Loading distance matrix from Google Drive...", ttl=1800)
+@st.cache_data(show_spinner="Loading distance matrix from Google Drive...", ttl=43200)
 def load_matrix_from_drive(_client, file_name):
     """Download matrix CSV from Google Drive and parse it."""
     from google.oauth2.service_account import Credentials as Creds
@@ -841,7 +841,46 @@ def main():
         if changed_drivers:
             changed_active = changed_drivers & set(d["name"] for d in active_drivers_with_dogs)
             if changed_active:
-                st.info(f"🔄 {len(changed_active)} driver(s) have changes since last optimization")
+                # Build dog name lookup from schedule
+                dog_name_lookup = {}
+                for row in schedule_data[2:]:
+                    if len(row) > 6:
+                        cid = row[6].strip()
+                        dname = row[1].strip() if len(row) > 1 else cid
+                        dog_name_lookup[cid] = dname
+
+                # Check for cancelled dogs in current schedule
+                cancelled_dogs = set()
+                for row in schedule_data[2:]:
+                    if len(row) > date_col_idx:
+                        cid = row[6].strip() if len(row) > 6 else ""
+                        val = row[date_col_idx].strip()
+                        if cid and "cancel" in val.lower():
+                            cancelled_dogs.add(cid)
+
+                # Build detail lines
+                change_details = []
+                for driver_name in sorted(changed_active):
+                    c = changes[driver_name]
+                    parts = []
+                    if c["added"]:
+                        added_items = []
+                        for cid, assignment in c["added"]:
+                            name = dog_name_lookup.get(cid, cid)[:25]
+                            added_items.append(f"{name} ({assignment})")
+                        parts.append(f"**added:** {', '.join(added_items)}")
+                    if c["removed"]:
+                        removed_items = []
+                        for cid, assignment in c["removed"]:
+                            name = dog_name_lookup.get(cid, cid)[:25]
+                            if cid in cancelled_dogs:
+                                removed_items.append(f"~~{name}~~ CANCELLED")
+                            else:
+                                removed_items.append(f"{name} ({assignment})")
+                        parts.append(f"**removed:** {', '.join(removed_items)}")
+                    change_details.append(f"• **{driver_name}** — {'; '.join(parts)}")
+                
+                st.info(f"🔄 {len(changed_active)} driver(s) have changes since last optimization:\n\n" + "\n".join(change_details))
         else:
             st.success("No changes detected since last optimization")
     else:
@@ -893,12 +932,16 @@ def main():
             name = d["name"]
             has_changes = name in changed_drivers
 
-            # Default: on first load, select changed drivers (or all if no snapshot)
-            if f"driver_{name}" not in st.session_state:
+            # Default: only on first load for this date
+            defaults_key = f"defaults_applied_{selected_date}"
+            if not st.session_state.get(defaults_key, False):
                 if changes is None or mostly_changed:
                     st.session_state[f"driver_{name}"] = True
                 else:
                     st.session_state[f"driver_{name}"] = has_changes
+
+    # Mark defaults as applied so they don't reset on every interaction
+    st.session_state[f"defaults_applied_{selected_date}"] = True
 
             # Simple label — just name + change indicator
             change_tag = " 🔄" if has_changes else ""
