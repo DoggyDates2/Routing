@@ -721,6 +721,11 @@ def main():
 
     st.title("🐕 Doggy Dates Route Optimizer")
 
+    # Refresh button to reload data from Sheets
+    if st.button("🔄 Refresh Data", help="Reload latest data from Google Sheets"):
+        st.cache_data.clear()
+        st.rerun()
+
     # ── Connect to Google Sheets ──
     try:
         client = get_gspread_client()
