@@ -537,6 +537,24 @@ def auto_add_to_matrix(client, matrix, missing_dogs, schedule_data):
             except ValueError:
                 continue
 
+    # Also load field/parking coordinates from Locations tab
+    try:
+        loc_sheet = client.open(SHEET_NAME)
+        loc_ws = loc_sheet.worksheet("Locations")
+        loc_data = loc_ws.get_all_values()
+        for row in loc_data[1:]:
+            if len(row) >= 3:
+                loc_id = row[0].strip()
+                lat = row[1].strip()
+                lng = row[2].strip()
+                if loc_id and lat and lng and loc_id in matrix:
+                    try:
+                        existing_with_coords[loc_id] = {"lat": float(lat), "lng": float(lng)}
+                    except ValueError:
+                        continue
+    except Exception:
+        pass  # Locations tab doesn't exist yet — skip
+
     existing_ids = list(existing_with_coords.keys())
     existing_coords = [[existing_with_coords[eid]["lng"], existing_with_coords[eid]["lat"]]
                        for eid in existing_ids]
@@ -614,7 +632,7 @@ def auto_add_to_matrix(client, matrix, missing_dogs, schedule_data):
                 nearby_coords.append(ecoord)
             else:
                 dist = haversine_miles(new_coords["lat"], new_coords["lng"], ecoord[1], ecoord[0])
-                if dist <= 5:
+                if dist <= 7:
                     nearby_ids.append(eid)
                     nearby_coords.append(ecoord)
 
