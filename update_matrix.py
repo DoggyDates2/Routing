@@ -151,9 +151,34 @@ def add_dogs_to_matrix(creds, matrix, missing_dogs, schedule_data, file_id, matr
         existing_to_new = {}
         batch_size = 25
 
-        for batch_start in range(0, len(existing_ids), batch_size):
-            batch_ids = existing_ids[batch_start:batch_start + batch_size]
-            batch_coords = existing_coords[batch_start:batch_start + batch_size]
+        # Haversine pre-filter: only compute ORS for nearby dogs + all fields/parking
+        import math
+        def haversine_miles(lat1, lon1, lat2, lon2):
+            R = 3959
+            dlat = math.radians(lat2 - lat1)
+            dlon = math.radians(lon2 - lon1)
+            a = (math.sin(dlat/2)**2 +
+                 math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) *
+                 math.sin(dlon/2)**2)
+            return R * 2 * math.asin(math.sqrt(a))
+
+        nearby_ids = []
+        nearby_coords = []
+        for eid, ecoord in zip(existing_ids, existing_coords):
+            if eid.endswith("F") or eid.endswith("P"):
+                nearby_ids.append(eid)
+                nearby_coords.append(ecoord)
+            else:
+                dist = haversine_miles(new_coords["lat"], new_coords["lng"], ecoord[1], ecoord[0])
+                if dist <= 5:
+                    nearby_ids.append(eid)
+                    nearby_coords.append(ecoord)
+
+        print(f"    {len(nearby_ids)} nearby locations (of {len(existing_ids)} total)")
+
+        for batch_start in range(0, len(nearby_ids), batch_size):
+            batch_ids = nearby_ids[batch_start:batch_start + batch_size]
+            batch_coords = nearby_coords[batch_start:batch_start + batch_size]
             locations = [new_loc] + batch_coords
             destinations = list(range(1, len(batch_coords) + 1))
 
