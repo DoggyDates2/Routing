@@ -724,6 +724,9 @@ def main():
     # Refresh button to reload data from Sheets
     if st.button("🔄 Refresh Data", help="Reload latest data from Google Sheets"):
         st.cache_data.clear()
+        for key in list(st.session_state.keys()):
+            if key.startswith("driver_") or key.startswith("defaults_applied"):
+                del st.session_state[key]
         st.rerun()
 
     # ── Connect to Google Sheets ──
