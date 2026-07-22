@@ -515,44 +515,60 @@ def write_results_to_sheet(client, sheet_name, new_results, optimized_drivers):
     sheet = client.open(sheet_name)
     
     header = ["Assignment", "Min to Next", "Dog Name", "Address", "Phone",
-              "Customer Name", "Instructions", "Dog Breed", "House Description", "Driver Trip"]
+              "Customer Name", "Instructions", "Dog Breed", "House Description",
+              "Driver Trip", "Customer ID"]
 
-    # Read existing results (if any) and keep rows for drivers NOT being re-optimized
+    # Read existing data for name preservation and merging
     existing_rows = []
+    custom_names = {}  # customer_id → manually edited dog name
     try:
         existing_ws = sheet.worksheet(OUTPUT_TAB_NAME)
         existing_data = existing_ws.get_all_values()
         
-        if (len(existing_data) > 0
-            and existing_data[0] == header
-            and len(optimized_drivers) < len(set(
-                row[0].split(":")[0] for row in existing_data[1:] 
-                if row and len(row) > 0 and ":" in row[0]
-            )) / 2):
+        if len(existing_data) > 0 and existing_data[0][:10] == header[:10]:
             for row in existing_data[1:]:
-                if len(row) > 0 and ":" in row[0]:
-                    row_driver = row[0].split(":")[0]
-                    if row_driver not in optimized_drivers:
-                        existing_rows.append(row)
-                elif len(row) > 9 and row[9]:
-                    # Check driver from DriverTrip column (e.g., "Jon1" → "Jon")
-                    import re as _re
-                    driver_match = _re.match(r'([A-Za-z]+)', row[9])
-                    if driver_match and driver_match.group(1) not in optimized_drivers:
-                        existing_rows.append(row)
+                # Check for manual name edits (column C = Dog Name, column K = Customer ID)
+                if len(row) > 10 and row[10]:  # has customer ID
+                    cid = row[10].strip()
+                    existing_name = row[2].strip() if len(row) > 2 else ""
+                    if cid and existing_name:
+                        custom_names[cid] = existing_name
+
+                # Keep rows for drivers NOT being re-optimized (for merge)
+                if (len(optimized_drivers) < len(set(
+                    r[0].split(":")[0] for r in existing_data[1:]
+                    if r and len(r) > 0 and ":" in r[0]
+                )) / 2):
+                    if len(row) > 0 and ":" in row[0]:
+                        row_driver = row[0].split(":")[0]
+                        if row_driver not in optimized_drivers:
+                            existing_rows.append(row)
+                    elif len(row) > 9 and row[9]:
+                        import re as _re
+                        driver_match = _re.match(r'([A-Za-z]+)', row[9])
+                        if driver_match and driver_match.group(1) not in optimized_drivers:
+                            existing_rows.append(row)
         
         sheet.del_worksheet(existing_ws)
     except gspread.exceptions.WorksheetNotFound:
         pass
 
-    # Build new rows
+    # Build new rows with name preservation
     new_rows = []
     for r in new_results:
         driver_trip = f"{r.get('Driver', '')}{r.get('Leg', '')}"
+        cid = r.get("Customer ID", "")
+        
+        # Use manually edited name if it exists for this customer
+        dog_name = r.get("Dog Name", "")
+        if cid in custom_names and custom_names[cid] != "":
+            # Only preserve if the action type matches (don't mix pickup/dropoff names)
+            dog_name = custom_names[cid]
+
         new_rows.append([
             r.get("Assignment", ""),
             r.get("Min to Next", ""),
-            r.get("Dog Name", ""),
+            dog_name,
             r.get("Address", ""),
             r.get("Phone", ""),
             r.get("Customer Name", ""),
@@ -560,17 +576,120 @@ def write_results_to_sheet(client, sheet_name, new_results, optimized_drivers):
             r.get("Dog Breed", ""),
             r.get("House Description", ""),
             driver_trip,
+            cid,
         ])
 
     # Combine: existing (unchanged drivers) + new (re-optimized drivers)
     all_rows = existing_rows + new_rows
 
-    ws = sheet.add_worksheet(title=OUTPUT_TAB_NAME, rows=len(all_rows) + 1, cols=10)
+    # Build checklist for columns M, N, O
+    checklist_rows = build_driver_checklist(new_results)
+    
+    # Determine sheet size
+    max_rows = max(len(all_rows), len(checklist_rows)) + 1
+    ws = sheet.add_worksheet(title=OUTPUT_TAB_NAME, rows=max_rows, cols=15)
+    
+    # Write route header and data (columns A-K)
     ws.update(range_name="A1", values=[header])
-
     if all_rows:
         ws.update(range_name="A2", values=all_rows)
+
+    # Write checklist header and data (columns M-O)
+    checklist_header = ["Dog", "Group", "Driver"]
+    ws.update(range_name="M1", values=[checklist_header])
+    if checklist_rows:
+        ws.update(range_name="M2", values=checklist_rows)
+
     return len(all_rows)
+
+
+def build_driver_checklist(results):
+    """Build a flat checklist of all dogs organized by driver and group."""
+    # Collect all dogs by driver and the groups they participate in
+    # Use the results to figure out which drivers and dogs exist
+    dog_groups = {}  # (driver, customer_id, dog_name) → set of groups
+    
+    for r in results:
+        driver = r.get("Driver", "")
+        cid = r.get("Customer ID", "")
+        action = r.get("Action", "")
+        raw_name = r.get("Dog Name", "")
+        
+        if not cid or not driver or action not in ("PICK UP", "DROP OFF"):
+            continue
+        
+        # Strip symbols from dog name to get clean name
+        clean_name = raw_name.replace("◼", "").replace("2️⃣", "").replace("3️⃣", "").strip()
+        # Remove "X & Y" prefix
+        import re as _re
+        clean_name = _re.sub(r'^\d+\s*&\s*\d+\s*', '', clean_name).strip()
+        
+        key = (driver, cid, clean_name)
+        if key not in dog_groups:
+            dog_groups[key] = set()
+        
+        # Figure out which group this stop belongs to
+        pickup_group = r.get("pickup_group", 0)
+        dropoff_group = r.get("dropoff_group", 0)
+        
+        # Add all groups this dog participates in
+        if pickup_group and dropoff_group:
+            for g in range(pickup_group, dropoff_group + 1):
+                dog_groups[key].add(g)
+        elif r.get("Leg"):
+            dog_groups[key].add(r.get("Leg"))
+    
+    # If dog_groups is empty, try building from assignments in results
+    if not dog_groups:
+        # Fallback: use Assignment column to determine groups
+        for r in results:
+            driver = r.get("Driver", "")
+            cid = r.get("Customer ID", "")
+            raw = r.get("Assignment", "")
+            action = r.get("Action", "")
+            raw_name = r.get("Dog Name", "")
+            
+            if not cid or not driver or action not in ("PICK UP",):
+                continue
+            
+            clean_name = raw_name.replace("2️⃣", "").replace("3️⃣", "").strip()
+            clean_name = _re.sub(r'^\d+\s*&\s*\d+\s*', '', clean_name).strip()
+            
+            key = (driver, cid, clean_name)
+            if key not in dog_groups:
+                dog_groups[key] = set()
+            
+            if ":" in raw:
+                code = raw.split(":")[1]
+                if "!" in code:
+                    for part in code.split("!"):
+                        digits = _re.findall(r'\d', part)
+                        if digits:
+                            for g in range(int(digits[0]), int(digits[-1]) + 1):
+                                dog_groups[key].add(g)
+                else:
+                    digits = _re.findall(r'\d', code)
+                    if digits:
+                        for g in range(int(digits[0]), int(digits[-1]) + 1):
+                            dog_groups[key].add(g)
+
+    # Build checklist rows
+    group_emoji = {1: "✅ ", 2: "💛 ", 3: "🔴 "}
+    checklist = []
+    
+    for (driver, cid, dog_name), groups_set in sorted(dog_groups.items()):
+        for g in sorted(groups_set):
+            emoji = group_emoji.get(g, "")
+            checklist.append([
+                f"{emoji}{dog_name}",
+                g,
+                driver,
+            ])
+    
+    # Sort by driver, then group
+    checklist.sort(key=lambda x: (x[2], x[1], x[0]))
+    
+    return checklist
 
 
 # =============================================================================
