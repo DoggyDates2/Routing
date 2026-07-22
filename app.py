@@ -636,16 +636,17 @@ def build_driver_checklist(results):
         if key not in dog_groups:
             dog_groups[key] = set()
         
-        # Figure out which group this stop belongs to
-        pickup_group = r.get("pickup_group", 0)
-        dropoff_group = r.get("dropoff_group", 0)
-        
-        # Add all groups this dog participates in
-        if pickup_group and dropoff_group:
-            for g in range(pickup_group, dropoff_group + 1):
-                dog_groups[key].add(g)
-        elif r.get("Leg"):
-            dog_groups[key].add(r.get("Leg"))
+        # Derive groups from the Assignment string (e.g. "Ali:2&3" -> groups 2,3).
+        # Never use Leg numbers: legs do not equal groups for 10AM drivers.
+        raw = r.get("Assignment", "")
+        if ":" in raw:
+            code = raw.split(":")[1]
+            parts = code.split("!") if "!" in code else [code]
+            for part in parts:
+                digits = _re.findall(r"\d", part)
+                if digits:
+                    for g in range(int(digits[0]), int(digits[-1]) + 1):
+                        dog_groups[key].add(g)
     
     # If dog_groups is empty, try building from assignments in results
     if not dog_groups:
