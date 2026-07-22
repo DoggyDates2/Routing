@@ -372,9 +372,14 @@ def repair_9999s(creds, matrix, schedule_data, file_id, matrix_text, ors_key):
         print("  No 9999 entries to repair.")
         return
 
-    # Limit to 50 pairs per run
-    batch = pairs_to_fix[:50]
-    print(f"  Found {len(pairs_to_fix)} pairs with 9999. Fixing {len(batch)} this run...")
+    # Prioritize: field/parking pairs first, then dog-to-dog
+    priority_pairs = [p for p in pairs_to_fix if p[0].endswith(('F', 'P')) or p[1].endswith(('F', 'P'))]
+    other_pairs = [p for p in pairs_to_fix if p not in priority_pairs]
+    sorted_pairs = priority_pairs + other_pairs
+
+    # Fix up to 500 pairs per run
+    batch = sorted_pairs[:500]
+    print(f"  Found {len(pairs_to_fix)} pairs with 9999 ({len(priority_pairs)} involve fields/parking). Fixing {len(batch)} this run...")
 
     # Parse CSV for editing
     reader_obj = csv.reader(io.StringIO(matrix_text))
