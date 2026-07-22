@@ -257,7 +257,7 @@ def derive_groups(assignments, driver_name):
 # ROUTE SOLVER
 # =============================================================================
 
-def solve_driver(matrix, driver_name, config, dogs):
+def solve_driver(matrix, driver_name, config, dogs, schedule_lookup):
     groups = config["groups"]
     field = config["field_id"]
     parking = config["parking_id"]
@@ -268,6 +268,62 @@ def solve_driver(matrix, driver_name, config, dogs):
     customer_dogs = [d for d in dogs if not d["is_staff_dog"]]
     staff_dogs = [d for d in dogs if d["is_staff_dog"]]
     dog_lookup = {d["customer_id"]: d for d in customer_dogs}
+
+    # Build a set of all customer_ids that have a ! assignment (split groups)
+    split_dogs = {}
+    for d in customer_dogs:
+        raw = d.get("raw", "")
+        if "!" in raw:
+            code = raw.split(":")[1] if ":" in raw else ""
+            split_dogs[d["customer_id"]] = code
+
+    def get_dog_display_name(loc_id, action):
+        """Build dog name with symbols based on action and assignment."""
+        d = dog_lookup.get(loc_id, {})
+        if not d:
+            return ""
+        name = d.get("dog_name", loc_id)
+
+        if action in ("DROP OFF",):
+            return f"◼{name}"
+
+        if action == "PICK UP":
+            cid = d.get("customer_id", "")
+            # Check for split groups (!)
+            if cid in split_dogs:
+                code = split_dogs[cid]
+                parts = code.split("!")
+                group_nums = []
+                for p in parts:
+                    digits = re.findall(r"\d", p)
+                    if digits:
+                        group_nums.append(digits[0])
+                return f"{' & '.join(group_nums)} {name}"
+
+            # Check how many groups the dog is staying for
+            pickup = d.get("pickup_group", 0)
+            dropoff = d.get("dropoff_group", 0)
+            groups_staying = dropoff - pickup + 1
+
+            if groups_staying == 3:
+                return f"3️⃣{name}"
+            elif groups_staying == 2:
+                return f"2️⃣{name}"
+            else:
+                return name
+
+        return name
+
+    def get_extra_info(loc_id):
+        """Get phone, customer name, instructions, breed, house desc from schedule lookup."""
+        info = schedule_lookup.get(loc_id, {})
+        return {
+            "Phone": info.get("phone", ""),
+            "Customer Name": info.get("customer_name", ""),
+            "Instructions": info.get("instructions", ""),
+            "Dog Breed": info.get("dog_breed", ""),
+            "House Description": info.get("house_description", ""),
+        }
 
     results = []
 
@@ -290,17 +346,30 @@ def solve_driver(matrix, driver_name, config, dogs):
                 route, dist = result
                 for i, loc_id in enumerate(route):
                     d = dog_lookup.get(loc_id, {})
+                    extra = get_extra_info(loc_id)
                     if loc_id == parking:
-                        action, label, addr = "START", "Leave Parking", parking_address
+                        action = "START"
+                        display_name = "Leave Parking"
+                        addr = parking_address
                     elif loc_id == field:
-                        action, label, addr = "ARRIVE", "Arrive at Field", field_address
+                        action = "ARRIVE"
+                        display_name = "Arrive at Field"
+                        addr = field_address
                     else:
-                        action, label, addr = "PICK UP", d.get("dog_name", loc_id), d.get("address", "")
+                        action = "PICK UP"
+                        display_name = get_dog_display_name(loc_id, action)
+                        addr = d.get("address", "")
                     results.append({
                         "Driver": driver_name, "Leg": leg_num + 1, "Stop": i + 1,
-                        "Action": action, "Customer ID": loc_id, "Dog Name": label,
-                        "Address": addr, "Dogs at Stop": d.get("dog_count", ""),
-                        "Dogs on Board": "", "Assignment": d.get("raw", ""),
+                        "Action": action, "Customer ID": loc_id,
+                        "Dog Name": display_name, "Address": addr,
+                        "Phone": extra.get("Phone", ""),
+                        "Customer Name": extra.get("Customer Name", ""),
+                        "Instructions": extra.get("Instructions", ""),
+                        "Dog Breed": extra.get("Dog Breed", ""),
+                        "House Description": extra.get("House Description", ""),
+                        "Dogs at Stop": d.get("dog_count", ""),
+                        "Dogs on Board": "", "Assignment": d.get("raw", "") or driver_name,
                         "Drive Min": round(dist, 1) if loc_id == field else "",
                     })
             else:
@@ -308,8 +377,10 @@ def solve_driver(matrix, driver_name, config, dogs):
                     "Driver": driver_name, "Leg": leg_num + 1, "Stop": 0,
                     "Action": "⚠️ FAILED", "Customer ID": "",
                     "Dog Name": f"Leg FAILED: {len(pickup_dogs)} stops, {total_dogs} dogs, capacity {capacity}",
-                    "Address": "", "Dogs at Stop": "", "Dogs on Board": "",
-                    "Assignment": "", "Drive Min": "",
+                    "Address": "", "Phone": "", "Customer Name": "",
+                    "Instructions": "", "Dog Breed": "", "House Description": "",
+                    "Dogs at Stop": "", "Dogs on Board": "",
+                    "Assignment": driver_name, "Drive Min": "",
                 })
 
         elif leg_num < len(groups):
@@ -359,17 +430,25 @@ def solve_driver(matrix, driver_name, config, dogs):
                 route, dist = result
                 for i, (loc_id, load, action_raw) in enumerate(route):
                     d = dog_lookup.get(loc_id, {})
+                    extra = get_extra_info(loc_id)
                     if action_raw == "LEAVE FIELD":
-                        label, addr = "Leave Field", field_address
+                        display_name, addr = "Leave Field", field_address
                     elif action_raw == "ARRIVE FIELD":
-                        label, addr = "Arrive at Field", field_address
+                        display_name, addr = "Arrive at Field", field_address
                     else:
-                        label, addr = d.get("dog_name", loc_id), d.get("address", "")
+                        display_name = get_dog_display_name(loc_id, action_raw)
+                        addr = d.get("address", "")
                     results.append({
                         "Driver": driver_name, "Leg": leg_num + 1, "Stop": i + 1,
-                        "Action": action_raw, "Customer ID": loc_id, "Dog Name": label,
-                        "Address": addr, "Dogs at Stop": d.get("dog_count", ""),
-                        "Dogs on Board": load, "Assignment": d.get("raw", ""),
+                        "Action": action_raw, "Customer ID": loc_id,
+                        "Dog Name": display_name, "Address": addr,
+                        "Phone": extra.get("Phone", ""),
+                        "Customer Name": extra.get("Customer Name", ""),
+                        "Instructions": extra.get("Instructions", ""),
+                        "Dog Breed": extra.get("Dog Breed", ""),
+                        "House Description": extra.get("House Description", ""),
+                        "Dogs at Stop": d.get("dog_count", ""),
+                        "Dogs on Board": load, "Assignment": d.get("raw", "") or driver_name,
                         "Drive Min": round(dist, 1) if action_raw == "ARRIVE FIELD" else "",
                     })
             else:
@@ -377,8 +456,10 @@ def solve_driver(matrix, driver_name, config, dogs):
                     "Driver": driver_name, "Leg": leg_num + 1, "Stop": 0,
                     "Action": "⚠️ FAILED", "Customer ID": "",
                     "Dog Name": f"Interleaved leg FAILED: drop {len(dropoffs)} ({dogs_being_dropped} dogs) + pick {len(pickups)} ({dogs_being_picked} dogs) + {staying_customer + staying_staff} staying = {initial_load} initial load, capacity {capacity}",
-                    "Address": "", "Dogs at Stop": "", "Dogs on Board": "",
-                    "Assignment": "", "Drive Min": "",
+                    "Address": "", "Phone": "", "Customer Name": "",
+                    "Instructions": "", "Dog Breed": "", "House Description": "",
+                    "Dogs at Stop": "", "Dogs on Board": "",
+                    "Assignment": driver_name, "Drive Min": "",
                 })
 
         else:
@@ -397,17 +478,28 @@ def solve_driver(matrix, driver_name, config, dogs):
                 route, dist = result
                 for i, loc_id in enumerate(route):
                     d = dog_lookup.get(loc_id, {})
+                    extra = get_extra_info(loc_id)
                     if loc_id == field:
-                        action, label, addr = "LEAVE", "Leave Field", field_address
+                        action = "LEAVE"
+                        display_name, addr = "Leave Field", field_address
                     elif loc_id == parking:
-                        action, label, addr = "ARRIVE", "Arrive at Parking", parking_address
+                        action = "ARRIVE"
+                        display_name, addr = "Arrive at Parking", parking_address
                     else:
-                        action, label, addr = "DROP OFF", d.get("dog_name", loc_id), d.get("address", "")
+                        action = "DROP OFF"
+                        display_name = get_dog_display_name(loc_id, action)
+                        addr = d.get("address", "")
                     results.append({
                         "Driver": driver_name, "Leg": leg_num + 1, "Stop": i + 1,
-                        "Action": action, "Customer ID": loc_id, "Dog Name": label,
-                        "Address": addr, "Dogs at Stop": d.get("dog_count", ""),
-                        "Dogs on Board": "", "Assignment": d.get("raw", ""),
+                        "Action": action, "Customer ID": loc_id,
+                        "Dog Name": display_name, "Address": addr,
+                        "Phone": extra.get("Phone", ""),
+                        "Customer Name": extra.get("Customer Name", ""),
+                        "Instructions": extra.get("Instructions", ""),
+                        "Dog Breed": extra.get("Dog Breed", ""),
+                        "House Description": extra.get("House Description", ""),
+                        "Dogs at Stop": d.get("dog_count", ""),
+                        "Dogs on Board": "", "Assignment": d.get("raw", "") or driver_name,
                         "Drive Min": round(dist, 1) if loc_id == parking else "",
                     })
 
@@ -419,27 +511,34 @@ def solve_driver(matrix, driver_name, config, dogs):
 # =============================================================================
 
 def write_results_to_sheet(client, sheet_name, new_results, optimized_drivers):
-    """Write routes to sheet, merging new results with existing ones for other drivers."""
+    """Write routes to sheet with new column layout."""
     sheet = client.open(sheet_name)
     
-    header = ["Driver", "Leg", "Stop", "Action", "Customer ID",
-              "Dog Name", "Address", "Dogs at Stop", "Dogs on Board", "Assignment", "Min to Next", "Drive Min"]
+    header = ["Drive Min", "Min to Next", "Dog Name", "Address", "Phone",
+              "Customer Name", "Instructions", "Dog Breed", "House Description", "Assignment"]
 
     # Read existing results (if any) and keep rows for drivers NOT being re-optimized
-    # Only merge if this is a small partial re-run (less than half the drivers)
     existing_rows = []
     try:
         existing_ws = sheet.worksheet(OUTPUT_TAB_NAME)
         existing_data = existing_ws.get_all_values()
         
-        # Only merge if header matches AND this is a partial re-run
+        # For merging, check if partial run — use Assignment column (index 9) to find driver
+        # Assignment format is "DriverName:code"
         if (len(existing_data) > 0
             and existing_data[0] == header
-            and len(optimized_drivers) < len(set(row[0] for row in existing_data[1:] if row)) / 2):
+            and len(optimized_drivers) < len(set(
+                row[9].split(":")[0] for row in existing_data[1:] 
+                if row and len(row) > 9 and ":" in row[9]
+            )) / 2):
             for row in existing_data[1:]:
-                if len(row) > 0 and row[0] not in optimized_drivers:
+                if len(row) > 9 and ":" in row[9]:
+                    row_driver = row[9].split(":")[0]
+                    if row_driver not in optimized_drivers:
+                        existing_rows.append(row)
+                elif len(row) > 0 and row[0]:
+                    # Keep non-dog rows (field/parking) if driver not in optimized list
                     existing_rows.append(row)
-        # Otherwise: full run or header mismatch — fresh start
         
         sheet.del_worksheet(existing_ws)
     except gspread.exceptions.WorksheetNotFound:
@@ -449,16 +548,22 @@ def write_results_to_sheet(client, sheet_name, new_results, optimized_drivers):
     new_rows = []
     for r in new_results:
         new_rows.append([
-            r["Driver"], r["Leg"], r["Stop"], r["Action"],
-            r["Customer ID"], r["Dog Name"], r["Address"],
-            r["Dogs at Stop"], r["Dogs on Board"], r.get("Assignment", ""),
-            r.get("Min to Next", ""), r["Drive Min"],
+            r.get("Drive Min", ""),
+            r.get("Min to Next", ""),
+            r.get("Dog Name", ""),
+            r.get("Address", ""),
+            r.get("Phone", ""),
+            r.get("Customer Name", ""),
+            r.get("Instructions", ""),
+            r.get("Dog Breed", ""),
+            r.get("House Description", ""),
+            r.get("Assignment", ""),
         ])
 
     # Combine: existing (unchanged drivers) + new (re-optimized drivers)
     all_rows = existing_rows + new_rows
 
-    ws = sheet.add_worksheet(title=OUTPUT_TAB_NAME, rows=len(all_rows) + 1, cols=12)
+    ws = sheet.add_worksheet(title=OUTPUT_TAB_NAME, rows=len(all_rows) + 1, cols=10)
     ws.update(range_name="A1", values=[header])
 
     if all_rows:
@@ -1013,12 +1118,25 @@ def main():
         errors = []
         progress = st.progress(0, text="Starting...")
 
+        # Build schedule lookup for extra columns
+        schedule_lookup = {}
+        for row in schedule_data[2:]:
+            cid = row[6].strip() if len(row) > 6 else ""
+            if cid:
+                schedule_lookup[cid] = {
+                    "phone": row[5].strip() if len(row) > 5 else "",
+                    "customer_name": row[3].strip() if len(row) > 3 else "",
+                    "instructions": row[62].strip() if len(row) > 62 else "",
+                    "dog_breed": row[60].strip() if len(row) > 60 else "",
+                    "house_description": row[61].strip() if len(row) > 61 else "",
+                }
+
         # Prepare jobs
         driver_jobs = []
         for name in selected_drivers:
             config = drivers[name]
             dogs = [a for a in assignments if a["driver"] == name]
-            driver_jobs.append((matrix, name, config, dogs))
+            driver_jobs.append((matrix, name, config, dogs, schedule_lookup))
 
         # Solve in parallel
         from concurrent.futures import ProcessPoolExecutor, as_completed
