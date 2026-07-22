@@ -510,8 +510,8 @@ def solve_driver(matrix, driver_name, config, dogs, schedule_lookup):
 # WRITE TO SHEET
 # =============================================================================
 
-def write_results_to_sheet(client, sheet_name, new_results, optimized_drivers):
-    """Write routes to sheet with new column layout."""
+def write_results_to_sheet(client, sheet_name, new_results, optimized_drivers, selected_date):
+    """Write routes to sheet with date tracking."""
     sheet = client.open(sheet_name)
     
     header = ["Assignment", "Min to Next", "Dog Name", "Address", "Phone",
@@ -520,25 +520,30 @@ def write_results_to_sheet(client, sheet_name, new_results, optimized_drivers):
 
     # Read existing data for name preservation and merging
     existing_rows = []
-    custom_names = {}  # customer_id → manually edited dog name
+    custom_names = {}
     try:
         existing_ws = sheet.worksheet(OUTPUT_TAB_NAME)
         existing_data = existing_ws.get_all_values()
         
-        if len(existing_data) > 0 and existing_data[0][:10] == header[:10]:
-            for row in existing_data[1:]:
-                # Check for manual name edits (column C = Dog Name, column K = Customer ID)
-                if len(row) > 10 and row[10]:  # has customer ID
+        # Check if existing data is from the same date
+        existing_date = existing_data[0][0] if existing_data else ""
+        same_date = (existing_date == selected_date)
+        
+        if same_date and len(existing_data) > 1 and existing_data[1] == header:
+            # Same date — check for manual name edits and merge
+            for row in existing_data[2:]:  # skip date row and header
+                if len(row) > 10 and row[10]:
                     cid = row[10].strip()
                     existing_name = row[2].strip() if len(row) > 2 else ""
                     if cid and existing_name:
                         custom_names[cid] = existing_name
 
-                # Keep rows for drivers NOT being re-optimized (for merge)
-                if (len(optimized_drivers) < len(set(
-                    r[0].split(":")[0] for r in existing_data[1:]
+                # Merge: keep rows for drivers NOT being re-optimized (partial runs only)
+                total_drivers_in_sheet = len(set(
+                    r[0].split(":")[0] for r in existing_data[2:]
                     if r and len(r) > 0 and ":" in r[0]
-                )) / 2):
+                ))
+                if len(optimized_drivers) < total_drivers_in_sheet / 2:
                     if len(row) > 0 and ":" in row[0]:
                         row_driver = row[0].split(":")[0]
                         if row_driver not in optimized_drivers:
@@ -548,6 +553,7 @@ def write_results_to_sheet(client, sheet_name, new_results, optimized_drivers):
                         driver_match = _re.match(r'([A-Za-z]+)', row[9])
                         if driver_match and driver_match.group(1) not in optimized_drivers:
                             existing_rows.append(row)
+        # Different date or no header match — full rewrite, no merge
         
         sheet.del_worksheet(existing_ws)
     except gspread.exceptions.WorksheetNotFound:
@@ -559,10 +565,8 @@ def write_results_to_sheet(client, sheet_name, new_results, optimized_drivers):
         driver_trip = f"{r.get('Driver', '')}{r.get('Leg', '')}"
         cid = r.get("Customer ID", "")
         
-        # Use manually edited name if it exists for this customer
         dog_name = r.get("Dog Name", "")
         if cid in custom_names and custom_names[cid] != "":
-            # Only preserve if the action type matches (don't mix pickup/dropoff names)
             dog_name = custom_names[cid]
 
         new_rows.append([
@@ -579,26 +583,30 @@ def write_results_to_sheet(client, sheet_name, new_results, optimized_drivers):
             cid,
         ])
 
-    # Combine: existing (unchanged drivers) + new (re-optimized drivers)
     all_rows = existing_rows + new_rows
 
     # Build checklist for columns M, N, O
     checklist_rows = build_driver_checklist(new_results)
     
-    # Determine sheet size
-    max_rows = max(len(all_rows), len(checklist_rows)) + 1
+    max_rows = max(len(all_rows), len(checklist_rows)) + 2  # +2 for date row and header
     ws = sheet.add_worksheet(title=OUTPUT_TAB_NAME, rows=max_rows, cols=15)
     
-    # Write route header and data (columns A-K)
-    ws.update(range_name="A1", values=[header])
+    # Row 1: Date
+    ws.update(range_name="A1", values=[[selected_date]])
+    
+    # Row 2: Header
+    ws.update(range_name="A2", values=[header])
+    
+    # Row 3+: Data
     if all_rows:
-        ws.update(range_name="A2", values=all_rows)
+        ws.update(range_name="A3", values=all_rows)
 
-    # Write checklist header and data (columns M-O)
+    # Checklist header and data (columns M-O)
     checklist_header = ["Dog", "Group", "Driver"]
-    ws.update(range_name="M1", values=[checklist_header])
+    ws.update(range_name="M1", values=[[selected_date]])
+    ws.update(range_name="M2", values=[checklist_header])
     if checklist_rows:
-        ws.update(range_name="M2", values=checklist_rows)
+        ws.update(range_name="M3", values=checklist_rows)
 
     return len(all_rows)
 
@@ -1318,7 +1326,7 @@ def main():
         # Auto-write to Google Sheet and save snapshot
         with st.spinner("Writing routes to Google Sheet..."):
             try:
-                count = write_results_to_sheet(client, SHEET_NAME, all_results, selected_drivers)
+                count = write_results_to_sheet(client, SHEET_NAME, all_results, selected_drivers, selected_date)
                 save_snapshot(client, SHEET_NAME, assignments)
                 st.session_state["write_success"] = f"✅ Wrote {count} total rows to '{OUTPUT_TAB_NAME}' (updated {len(selected_drivers)} drivers, kept others)."
             except Exception as e:
