@@ -526,7 +526,7 @@ def write_results_to_sheet(client, sheet_name, new_results, optimized_drivers, s
         existing_data = existing_ws.get_all_values()
         
         # Check if existing data is from the same date
-        existing_date = existing_data[0][0] if existing_data else ""
+        existing_date = existing_data[0][0] if existing_data and existing_data[0] else ""
         same_date = (existing_date == selected_date)
         
         if same_date and len(existing_data) > 1 and existing_data[1] == header:
@@ -1330,7 +1330,8 @@ def main():
                 save_snapshot(client, SHEET_NAME, assignments)
                 st.session_state["write_success"] = f"✅ Wrote {count} total rows to '{OUTPUT_TAB_NAME}' (updated {len(selected_drivers)} drivers, kept others)."
             except Exception as e:
-                st.session_state["write_error"] = f"Failed to write: {e}"
+                import traceback
+                st.session_state["write_error"] = f"Failed to write: {e}\n\n{traceback.format_exc()}"
 
     # ── Results ──
     if "results" in st.session_state and st.session_state["results"]:
