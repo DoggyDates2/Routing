@@ -514,8 +514,8 @@ def write_results_to_sheet(client, sheet_name, new_results, optimized_drivers):
     """Write routes to sheet with new column layout."""
     sheet = client.open(sheet_name)
     
-    header = ["Drive Min", "Min to Next", "Dog Name", "Address", "Phone",
-              "Customer Name", "Instructions", "Dog Breed", "House Description", "Assignment"]
+    header = ["Assignment", "Min to Next", "Dog Name", "Address", "Phone",
+              "Customer Name", "Instructions", "Dog Breed", "House Description", "Driver Trip"]
 
     # Read existing results (if any) and keep rows for drivers NOT being re-optimized
     existing_rows = []
@@ -523,22 +523,23 @@ def write_results_to_sheet(client, sheet_name, new_results, optimized_drivers):
         existing_ws = sheet.worksheet(OUTPUT_TAB_NAME)
         existing_data = existing_ws.get_all_values()
         
-        # For merging, check if partial run — use Assignment column (index 9) to find driver
-        # Assignment format is "DriverName:code"
         if (len(existing_data) > 0
             and existing_data[0] == header
             and len(optimized_drivers) < len(set(
-                row[9].split(":")[0] for row in existing_data[1:] 
-                if row and len(row) > 9 and ":" in row[9]
+                row[0].split(":")[0] for row in existing_data[1:] 
+                if row and len(row) > 0 and ":" in row[0]
             )) / 2):
             for row in existing_data[1:]:
-                if len(row) > 9 and ":" in row[9]:
-                    row_driver = row[9].split(":")[0]
+                if len(row) > 0 and ":" in row[0]:
+                    row_driver = row[0].split(":")[0]
                     if row_driver not in optimized_drivers:
                         existing_rows.append(row)
-                elif len(row) > 0 and row[0]:
-                    # Keep non-dog rows (field/parking) if driver not in optimized list
-                    existing_rows.append(row)
+                elif len(row) > 9 and row[9]:
+                    # Check driver from DriverTrip column (e.g., "Jon1" → "Jon")
+                    import re as _re
+                    driver_match = _re.match(r'([A-Za-z]+)', row[9])
+                    if driver_match and driver_match.group(1) not in optimized_drivers:
+                        existing_rows.append(row)
         
         sheet.del_worksheet(existing_ws)
     except gspread.exceptions.WorksheetNotFound:
@@ -547,8 +548,9 @@ def write_results_to_sheet(client, sheet_name, new_results, optimized_drivers):
     # Build new rows
     new_rows = []
     for r in new_results:
+        driver_trip = f"{r.get('Driver', '')}{r.get('Leg', '')}"
         new_rows.append([
-            r.get("Drive Min", ""),
+            r.get("Assignment", ""),
             r.get("Min to Next", ""),
             r.get("Dog Name", ""),
             r.get("Address", ""),
@@ -557,7 +559,7 @@ def write_results_to_sheet(client, sheet_name, new_results, optimized_drivers):
             r.get("Instructions", ""),
             r.get("Dog Breed", ""),
             r.get("House Description", ""),
-            r.get("Assignment", ""),
+            driver_trip,
         ])
 
     # Combine: existing (unchanged drivers) + new (re-optimized drivers)
