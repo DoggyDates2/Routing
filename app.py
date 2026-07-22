@@ -991,46 +991,53 @@ def main():
         if changed_drivers:
             changed_active = changed_drivers & set(d["name"] for d in active_drivers_with_dogs)
             if changed_active:
-                # Build dog name lookup from schedule
-                dog_name_lookup = {}
-                for row in schedule_data[2:]:
-                    if len(row) > 6:
-                        cid = row[6].strip()
-                        dname = row[1].strip() if len(row) > 1 else cid
-                        dog_name_lookup[cid] = dname
+                # Count total changes
+                total_changes = sum(len(changes[d]["added"]) + len(changes[d]["removed"]) for d in changed_active)
 
-                # Check for cancelled dogs in current schedule
-                cancelled_dogs = set()
-                for row in schedule_data[2:]:
-                    if len(row) > date_col_idx:
-                        cid = row[6].strip() if len(row) > 6 else ""
-                        val = row[date_col_idx].strip()
-                        if cid and "cancel" in val.lower():
-                            cancelled_dogs.add(cid)
+                # If too many changes, just show summary
+                if len(changed_active) > 7 or total_changes > 30:
+                    st.info(f"🔄 {len(changed_active)} driver(s) have changes since last optimization ({total_changes} total changes). Select All and re-optimize.")
+                else:
+                    # Build dog name lookup from schedule
+                    dog_name_lookup = {}
+                    for row in schedule_data[2:]:
+                        if len(row) > 6:
+                            cid = row[6].strip()
+                            dname = row[1].strip() if len(row) > 1 else cid
+                            dog_name_lookup[cid] = dname
 
-                # Build detail lines
-                change_details = []
-                for driver_name in sorted(changed_active):
-                    c = changes[driver_name]
-                    parts = []
-                    if c["added"]:
-                        added_items = []
-                        for cid, assignment in c["added"]:
-                            name = dog_name_lookup.get(cid, cid)[:25]
-                            added_items.append(f"{name} ({assignment})")
-                        parts.append(f"**added:** {', '.join(added_items)}")
-                    if c["removed"]:
-                        removed_items = []
-                        for cid, assignment in c["removed"]:
-                            name = dog_name_lookup.get(cid, cid)[:25]
-                            if cid in cancelled_dogs:
-                                removed_items.append(f"~~{name}~~ CANCELLED")
-                            else:
-                                removed_items.append(f"{name} ({assignment})")
-                        parts.append(f"**removed:** {', '.join(removed_items)}")
-                    change_details.append(f"• **{driver_name}** — {'; '.join(parts)}")
-                
-                st.info(f"🔄 {len(changed_active)} driver(s) have changes since last optimization:\n\n" + "\n".join(change_details))
+                    # Check for cancelled dogs in current schedule
+                    cancelled_dogs = set()
+                    for row in schedule_data[2:]:
+                        if len(row) > date_col_idx:
+                            cid = row[6].strip() if len(row) > 6 else ""
+                            val = row[date_col_idx].strip()
+                            if cid and "cancel" in val.lower():
+                                cancelled_dogs.add(cid)
+
+                    # Build detail lines
+                    change_details = []
+                    for driver_name in sorted(changed_active):
+                        c = changes[driver_name]
+                        parts = []
+                        if c["added"]:
+                            added_items = []
+                            for cid, assignment in c["added"]:
+                                name = dog_name_lookup.get(cid, cid)[:25]
+                                added_items.append(f"{name} ({assignment})")
+                            parts.append(f"**added:** {', '.join(added_items)}")
+                        if c["removed"]:
+                            removed_items = []
+                            for cid, assignment in c["removed"]:
+                                name = dog_name_lookup.get(cid, cid)[:25]
+                                if cid in cancelled_dogs:
+                                    removed_items.append(f"~~{name}~~ CANCELLED")
+                                else:
+                                    removed_items.append(f"{name} ({assignment})")
+                            parts.append(f"**removed:** {', '.join(removed_items)}")
+                        change_details.append(f"• **{driver_name}** — {'; '.join(parts)}")
+                    
+                    st.info(f"🔄 {len(changed_active)} driver(s) have changes since last optimization:\n\n" + "\n".join(change_details))
         else:
             st.success("No changes detected since last optimization")
     else:
