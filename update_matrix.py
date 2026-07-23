@@ -232,6 +232,9 @@ def find_missing_dogs(matrix, schedule_data):
     return missing
 
 
+_ORS_QUOTA_HIT = {"v": False}
+
+
 def _ors_matrix_call(url, headers, payload, log):
     """POST to ORS matrix API with one retry on rate-limit (429)."""
     import time as _t
@@ -241,10 +244,11 @@ def _ors_matrix_call(url, headers, payload, log):
         try:
             resp = _rq.post(url, headers=headers, json=payload, timeout=30)
             if resp.status_code == 403:
+                _ORS_QUOTA_HIT["v"] = True
                 _rem = resp.headers.get("x-ratelimit-remaining", "?")
                 _rst = resp.headers.get("x-ratelimit-reset", "?")
                 log(f"    ORS DAILY quota exhausted (403) — remaining: {_rem}, resets: {_rst}. "
-                    f"No retry will help until the 24h window frees up.")
+                    f"Aborting remaining ORS work for this run.")
                 return resp
             if resp.status_code == 429 and attempt < 4:
                 _rem = resp.headers.get("x-ratelimit-remaining", "?")
@@ -308,7 +312,11 @@ def add_dogs_to_matrix(creds, matrix, missing_dogs, schedule_data, file_id, matr
     header = all_rows[0]
     data_rows = all_rows[1:]
 
+    _ORS_QUOTA_HIT["v"] = False
     for new_id, new_coords in missing_dogs.items():
+        if _ORS_QUOTA_HIT["v"]:
+            print("    Daily ORS quota exhausted — skipping remaining dogs this run.")
+            break
         print(f"  Adding {new_id}...")
         new_loc = [new_coords["lng"], new_coords["lat"]]
         new_to_existing = {}
@@ -341,6 +349,8 @@ def add_dogs_to_matrix(creds, matrix, missing_dogs, schedule_data, file_id, matr
         print(f"    {len(nearby_ids)} nearby locations (of {len(existing_ids)} total)")
 
         for batch_start in range(0, len(nearby_ids), batch_size):
+            if _ORS_QUOTA_HIT["v"]:
+                break
             batch_ids = nearby_ids[batch_start:batch_start + batch_size]
             batch_coords = nearby_coords[batch_start:batch_start + batch_size]
             locations = [new_loc] + batch_coords
@@ -555,6 +565,9 @@ def repair_9999s(creds, matrix, schedule_data, file_id, matrix_text, ors_key):
     batch_size = 10  # ORS pairs per request
 
     for i in range(0, len(batch), batch_size):
+        if _ORS_QUOTA_HIT["v"]:
+            print("    Daily ORS quota exhausted — stopping repair pass for this run.")
+            break
         sub_batch = batch[i:i + batch_size]
 
         for from_id, to_id in sub_batch:
