@@ -381,12 +381,12 @@ def add_dogs_to_matrix(creds, matrix, missing_dogs, schedule_data, file_id, matr
 
         _cov_out = len(new_to_existing)
         _cov_in = len(existing_to_new)
-        _cov_msg = (f"    {new_id}: computed {_cov_out}/{len(nearby_ids)} outbound, "
-                    f"{_cov_in}/{len(nearby_ids)} inbound distances"
-                    + (" — ⚠️ MOSTLY 9999s WILL BE WRITTEN, check ORS key/quota and coordinates"
-                       if len(nearby_ids) and (_cov_out < len(nearby_ids) // 2 or _cov_in < len(nearby_ids) // 2)
-                       else ""))
-        print(_cov_msg)
+        if len(nearby_ids) and (_cov_out < len(nearby_ids) // 2 or _cov_in < len(nearby_ids) // 2):
+            print(f"    {new_id}: only computed {_cov_out}/{len(nearby_ids)} outbound, "
+                  f"{_cov_in}/{len(nearby_ids)} inbound — NOT added (stays missing for a "
+                  f"future run with quota). Check ORS key/quota.")
+            continue  # never write a mostly-9999 dog
+        print(f"    {new_id}: computed {_cov_out}/{len(nearby_ids)} outbound, {_cov_in}/{len(nearby_ids)} inbound distances")
 
         # Update CSV
         header.append(new_id)
