@@ -585,8 +585,9 @@ def write_results_to_sheet(client, sheet_name, new_results, optimized_drivers, s
 
     all_rows = existing_rows + new_rows
 
-    # Build checklist for columns M, N, O
-    checklist_rows = build_driver_checklist(new_results)
+    # Build checklist for columns M, N, O — from the MERGED rows, so drivers that
+    # weren't re-optimized keep their checklist entries (bug fix)
+    checklist_rows = build_driver_checklist(rows_to_checklist_results(all_rows))
     
     max_rows = max(len(all_rows), len(checklist_rows)) + 2  # +2 for date row and header
     ws = sheet.add_worksheet(title=OUTPUT_TAB_NAME, rows=max_rows, cols=15)
@@ -609,6 +610,277 @@ def write_results_to_sheet(client, sheet_name, new_results, optimized_drivers, s
         ws.update(range_name="M3", values=checklist_rows)
 
     return len(all_rows)
+
+
+ANCHOR_ID_RE = re.compile(r"^\d+[FP]$")
+
+
+def rows_to_checklist_results(rows):
+    """Convert sheet-format rows (lists) into dicts build_driver_checklist understands.
+    Fixes the bug where partial re-runs dropped non-optimized drivers from the checklist."""
+    out = []
+    for row in rows:
+        if not row or len(row) < 11:
+            continue
+        cid = (row[10] or "").strip()
+        if not cid or ANCHOR_ID_RE.match(cid):
+            continue
+        assign = (row[0] or "").strip()
+        driver = assign.split(":")[0].strip() if ":" in assign else ""
+        if not driver and len(row) > 9 and row[9]:
+            m = re.match(r"([A-Za-z]+)", row[9])
+            driver = m.group(1) if m else ""
+        if not driver:
+            continue
+        out.append({
+            "Driver": driver, "Customer ID": cid, "Action": "PICK UP",
+            "Dog Name": row[2] or "", "Assignment": assign,
+        })
+    return out
+
+
+def _surgical_compute(rows, matrix, driver_name, config, assignments, schedule_lookup):
+    """Pure computation: given current sheet rows (row 3+ as lists, padded to 11 cols),
+    apply Schedule differences for one driver surgically. Returns (final_rows, report).
+    Raises ValueError with a user-facing message on any refusal. Never touches the sheet."""
+    groups = derive_groups(assignments, driver_name)
+    if not groups:
+        raise ValueError(f"{driver_name} has no groups on the Schedule for this date.")
+    trip_of_pickup = {g: i + 1 for i, g in enumerate(groups)}
+    trip_of_dropoff = {g: i + 2 for i, g in enumerate(groups)}
+    capacity = config["capacity"]
+
+    trip_re = re.compile(rf"^{re.escape(driver_name)}(\d+)$")
+    trip_rows = {}
+    for idx, row in enumerate(rows):
+        m = trip_re.match((row[9] or "").strip()) if len(row) > 9 else None
+        if m:
+            trip_rows.setdefault(int(m.group(1)), []).append(idx)
+    if not trip_rows:
+        raise ValueError(
+            f"No existing route rows found for {driver_name} — run a full optimization for this driver first."
+        )
+
+    my_assignments = [a for a in assignments if a["driver"] == driver_name and not a["is_staff_dog"]]
+    staff_load = sum(a["dog_count"] for a in assignments
+                     if a["driver"] == driver_name and a["is_staff_dog"])
+    sched_by_cid = {}
+    for a in my_assignments:
+        sched_by_cid.setdefault(a["customer_id"], []).append(a)
+
+    sheet_cids = set()
+    for idxs in trip_rows.values():
+        for i in idxs:
+            cid = (rows[i][10] or "").strip()
+            if cid and not ANCHOR_ID_RE.match(cid):
+                sheet_cids.add(cid)
+
+    new_cids = [c for c in sched_by_cid if c not in sheet_cids]
+    removed_cids = [c for c in sheet_cids if c not in sched_by_cid]
+    if not new_cids and not removed_cids:
+        return None, []
+
+    for c in new_cids:
+        if len(sched_by_cid[c]) > 1:
+            nm = sched_by_cid[c][0]["dog_name"] or c
+            raise ValueError(
+                f"{nm} has a split ('!') assignment — surgical add can't handle split trips. "
+                f"Run a full re-optimization for {driver_name}."
+            )
+
+    report = []
+    touched_trips = set()
+    removed_set = set(removed_cids)
+    deleted = set()
+
+    if removed_cids:
+        removed_names = []
+        for t, idxs in list(trip_rows.items()):
+            keep = []
+            for i in idxs:
+                if (rows[i][10] or "").strip() in removed_set:
+                    nm = (rows[i][2] or "").strip() or (rows[i][10] or "").strip()
+                    if nm not in removed_names:
+                        removed_names.append(nm)
+                    deleted.add(i)
+                    touched_trips.add(t)
+                else:
+                    keep.append(i)
+            trip_rows[t] = keep
+        report.append("Removed " + ", ".join(removed_names) + " — everyone else stays in the same order.")
+
+    def dist(a, b):
+        try:
+            v = matrix[a][b]
+            return float(v)
+        except Exception:
+            return 9999.0
+
+    def row_delta(row, trip):
+        cid = (row[10] or "").strip()
+        if not cid or ANCHOR_ID_RE.match(cid):
+            return 0
+        alist = sched_by_cid.get(cid)
+        if not alist:
+            return 0
+        a = alist[0]
+        if trip_of_pickup.get(a["pickup_group"]) == trip:
+            return a["dog_count"]
+        if trip_of_dropoff.get(a["dropoff_group"]) == trip:
+            return -a["dog_count"]
+        return 0
+
+    def entering_load(trip):
+        load = staff_load
+        for a in my_assignments:
+            tp = trip_of_pickup.get(a["pickup_group"])
+            td = trip_of_dropoff.get(a["dropoff_group"])
+            if tp is not None and td is not None and tp < trip <= td:
+                load += a["dog_count"]
+        return load
+
+    def trip_loads(trip):
+        start = entering_load(trip)
+        loads, cur = [], start
+        for i in trip_rows.get(trip, []):
+            cur += row_delta(rows[i], trip)
+            loads.append(cur)
+        return start, loads
+
+    inserts = {}  # orig_index -> list of new rows placed AFTER that index
+
+    def make_row(a, trip):
+        extra = schedule_lookup.get(a["customer_id"], {})
+        cnt = a["dog_count"]
+        prefix = "2\u20e3 " if cnt == 2 else ("3\u20e3 " if cnt == 3 else "")
+        return [
+            a["raw"], "", prefix + (a["dog_name"] or a["customer_id"]), a["address"],
+            extra.get("phone", ""), extra.get("customer_name", ""),
+            extra.get("instructions", ""), extra.get("dog_breed", ""),
+            extra.get("house_description", ""), f"{driver_name}{trip}", a["customer_id"],
+        ]
+
+    def insert(trip, new_row, cnt, is_pickup, label):
+        idxs = trip_rows.get(trip)
+        if not idxs or len(idxs) < 2:
+            raise ValueError(
+                f"Trip {driver_name}{trip} not found (or too short) in the sheet — run a full re-optimization."
+            )
+        start, loads = trip_loads(trip)
+        seq_ids = [(rows[i][10] or "").strip() for i in idxs]
+        new_id = new_row[10]
+        best = None
+        for k in range(len(idxs) - 1):
+            a_id, b_id = seq_ids[k], seq_ids[k + 1]
+            if not a_id or not b_id:
+                continue
+            cost = dist(a_id, new_id) + dist(new_id, b_id) - dist(a_id, b_id)
+            if cost >= 9000:
+                continue
+            if is_pickup:
+                if max(loads[k:]) + cnt > capacity:
+                    continue
+            else:
+                if max([start] + loads[: k + 1]) > capacity:
+                    continue
+            if best is None or cost < best[1]:
+                best = (k, cost)
+        if best is None:
+            raise ValueError(
+                f"No capacity-feasible spot for {label} in {driver_name}{trip} "
+                f"(capacity {capacity}) — run a full re-optimization."
+            )
+        k, cost = best
+        inserts.setdefault(idxs[k], []).append(new_row)
+        touched_trips.add(trip)
+        prev_name = (rows[idxs[k]][2] or "").strip() or "the start of the trip"
+        return prev_name, cost
+
+    for cid in new_cids:
+        a = sched_by_cid[cid][0]
+        pu, do = a["pickup_group"], a["dropoff_group"]
+        tp = trip_of_pickup.get(pu)
+        td = trip_of_dropoff.get(do)
+        if tp is None or td is None:
+            raise ValueError(
+                f"{a['dog_name'] or cid}'s groups ({a['raw']}) don't match {driver_name}'s trips — "
+                f"run a full re-optimization."
+            )
+        for mid in range(tp + 1, td):
+            m_start, m_loads = trip_loads(mid)
+            if max([m_start] + m_loads) > capacity:
+                raise ValueError(
+                    f"Adding {a['dog_name'] or cid} would exceed capacity in {driver_name}{mid} — "
+                    f"run a full re-optimization."
+                )
+        prev_name, cost = insert(tp, make_row(a, tp), a["dog_count"], True,
+                                 a["dog_name"] or cid)
+        insert(td, make_row(a, td), a["dog_count"], False, a["dog_name"] or cid)
+        report.append(
+            f"{a['dog_name'] or cid}: picked up right after {prev_name} in {driver_name}{tp} "
+            f"(+{cost:.1f} min) — no other stops moved. Drop-off auto-placed in {driver_name}{td}."
+        )
+
+    # ── assemble final rows ──
+    final_rows = []
+    for idx, row in enumerate(rows):
+        if idx not in deleted:
+            final_rows.append(row)
+        for nr in inserts.get(idx, []):
+            final_rows.append(nr)
+
+    # ── recompute Min-to-Next for touched trips ──
+    for t in touched_trips:
+        label = f"{driver_name}{t}"
+        t_idx = [i for i, r in enumerate(final_rows) if (r[9] or "").strip() == label]
+        for pos, i in enumerate(t_idx):
+            if pos == len(t_idx) - 1:
+                final_rows[i][1] = ""
+                continue
+            a_id = (final_rows[i][10] or "").strip()
+            b_id = (final_rows[t_idx[pos + 1]][10] or "").strip()
+            d = dist(a_id, b_id) if a_id and b_id else 9999.0
+            final_rows[i][1] = round(d, 1) if d < 9000 else ""
+
+    return final_rows, report
+
+
+def surgical_apply(client, sheet_name, matrix, driver_name, config, assignments,
+                   schedule_lookup, selected_date):
+    """Sheet wrapper around _surgical_compute. All validation happens BEFORE the tab
+    is rewritten, so refusals never destroy existing routes."""
+    sheet = client.open(sheet_name)
+    try:
+        ws = sheet.worksheet(OUTPUT_TAB_NAME)
+    except gspread.exceptions.WorksheetNotFound:
+        raise ValueError("No Routes tab found — run a full optimization first.")
+    data = ws.get_all_values()
+    if not data or not data[0] or (data[0][0] or "").strip() != selected_date:
+        raise ValueError("The Routes tab is for a different date — run a full optimization first.")
+    rows = [list(r) + [""] * (11 - len(r)) for r in data[2:]]
+
+    final_rows, report = _surgical_compute(
+        rows, matrix, driver_name, config, assignments, schedule_lookup
+    )
+    if final_rows is None:
+        return []
+
+    header = ["Assignment", "Min to Next", "Dog Name", "Address", "Phone",
+              "Customer Name", "Instructions", "Dog Breed", "House Description",
+              "Driver Trip", "Customer ID"]
+    checklist_rows = build_driver_checklist(rows_to_checklist_results(final_rows))
+    max_rows = max(len(final_rows), len(checklist_rows)) + 2
+    sheet.del_worksheet(ws)
+    ws = sheet.add_worksheet(title=OUTPUT_TAB_NAME, rows=max_rows, cols=15)
+    ws.update(range_name="A1", values=[[selected_date]])
+    ws.update(range_name="A2", values=[header])
+    if final_rows:
+        ws.update(range_name="A3", values=final_rows)
+    ws.update(range_name="M1", values=[[selected_date]])
+    ws.update(range_name="M2", values=[["Dog", "Group", "Driver"]])
+    if checklist_rows:
+        ws.update(range_name="M3", values=checklist_rows)
+    return report
 
 
 def build_driver_checklist(results):
@@ -1477,6 +1749,49 @@ def main():
         if over_capacity:
             st.warning(f"🐕 {len(over_capacity)} driver(s) over capacity:")
             st.dataframe(pd.DataFrame(over_capacity), use_container_width=True, hide_index=True)
+
+    # ── Surgical Add ──
+    st.divider()
+    st.subheader("🔧 Surgical Add")
+    st.caption(
+        "Apply Schedule changes for ONE driver without reshuffling their existing route — "
+        "for mid-trip changes. Edit the Schedule tab first, hit Refresh Data, then pick the driver. "
+        "New pickups get inserted at the cheapest capacity-safe spot; drop-offs are placed "
+        "automatically. Use the main Optimize button when a full reshuffle is fine."
+    )
+    surg_driver = st.selectbox("Driver", scheduled_names, key="surgical_driver")
+    if st.button("🪡 Apply schedule changes surgically", key="surgical_btn") and surg_driver:
+        _cfg = drivers.get(surg_driver)
+        if not _cfg or not _cfg["field_id"] or not _cfg["capacity"]:
+            st.error(f"{surg_driver} has no usable Staff row (field/parking/capacity).")
+        else:
+            _surg_lookup = {}
+            for _row in schedule_data[2:]:
+                _cid = _row[6].strip() if len(_row) > 6 else ""
+                if _cid:
+                    _surg_lookup[_cid] = {
+                        "phone": _row[5].strip() if len(_row) > 5 else "",
+                        "customer_name": _row[3].strip() if len(_row) > 3 else "",
+                        "instructions": _row[62].strip() if len(_row) > 62 else "",
+                        "dog_breed": _row[60].strip() if len(_row) > 60 else "",
+                        "house_description": _row[61].strip() if len(_row) > 61 else "",
+                    }
+            with st.spinner(f"Surgically updating {surg_driver}'s route..."):
+                try:
+                    _rep = surgical_apply(
+                        client, SHEET_NAME, matrix, surg_driver, _cfg,
+                        assignments, _surg_lookup, selected_date,
+                    )
+                    if _rep:
+                        for _line in _rep:
+                            st.success(_line)
+                    else:
+                        st.info(f"No differences between the Schedule and {surg_driver}'s current route.")
+                except ValueError as _e:
+                    st.error(str(_e))
+                except Exception as _e:
+                    import traceback
+                    st.error(f"Surgical update failed — routes were NOT rewritten: {_e}\n\n{traceback.format_exc()}")
 
 
 
