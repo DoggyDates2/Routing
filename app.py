@@ -639,7 +639,7 @@ def rows_to_checklist_results(rows):
     return out
 
 
-def _surgical_compute(rows, matrix, driver_name, config, assignments, schedule_lookup):
+def _surgical_compute(rows, matrix, driver_name, config, assignments, schedule_lookup, target_cid=None):
     """Pure computation: given current sheet rows (row 3+ as lists, padded to 11 cols),
     apply Schedule differences for one driver surgically. Returns (final_rows, report).
     Raises ValueError with a user-facing message on any refusal. Never touches the sheet."""
@@ -677,6 +677,9 @@ def _surgical_compute(rows, matrix, driver_name, config, assignments, schedule_l
 
     new_cids = [c for c in sched_by_cid if c not in sheet_cids]
     removed_cids = [c for c in sheet_cids if c not in sched_by_cid]
+    if target_cid is not None:
+        new_cids = [c for c in new_cids if c == target_cid]
+        removed_cids = [c for c in removed_cids if c == target_cid]
     if not new_cids and not removed_cids:
         return None, []
 
@@ -796,6 +799,78 @@ def _surgical_compute(rows, matrix, driver_name, config, assignments, schedule_l
         prev_name = (rows[idxs[k]][2] or "").strip() or "the start of the trip"
         return prev_name, cost
 
+    def _resolve_dropoff_trip(td, new_a):
+        """Fully re-solve the drop-off trip (it hasn't started yet). Existing rows for
+        that trip are reordered per the solver; the new dog's row is added."""
+        idxs = trip_rows.get(td)
+        if not idxs or len(idxs) < 2:
+            raise ValueError(f"Trip {driver_name}{td} not found in the sheet — run a full re-optimization.")
+        anchor_first, anchor_last = rows[idxs[0]], rows[idxs[-1]]
+        # sheet-derived trip span per dog: first appearance = pickup trip, last = dropoff trip
+        cid_trips = {}
+        for t, ii in trip_rows.items():
+            for i in ii:
+                c = (rows[i][10] or "").strip()
+                if c and not ANCHOR_ID_RE.match(c):
+                    cid_trips.setdefault(c, set()).add(t)
+        row_by_cid = {}
+        for i in idxs[1:-1]:
+            c = (rows[i][10] or "").strip()
+            if c and not ANCHOR_ID_RE.match(c):
+                row_by_cid[c] = rows[i]
+        def cnt_of(c):
+            al = sched_by_cid.get(c)
+            if al:
+                return al[0]["dog_count"]
+            nm = (row_by_cid.get(c, ["", "", ""])[2] or "")
+            if nm.startswith("2\u20e3"):
+                return 2
+            if nm.startswith("3\u20e3"):
+                return 3
+            return 1
+        drops, picks = [], []
+        for c in row_by_cid:
+            span = cid_trips.get(c, {td})
+            if min(span) == td and max(span) != td:
+                picks.append((c, cnt_of(c)))
+            else:
+                drops.append((c, cnt_of(c)))
+        drops.append((new_a["customer_id"], new_a["dog_count"]))
+        load = staff_load + new_a["dog_count"]
+        for c, span in cid_trips.items():
+            if min(span) < td <= max(span):
+                load += cnt_of(c)
+        is_final = (td == len(groups) + 1)
+        def row_for(c):
+            if c == new_a["customer_id"]:
+                return make_row(new_a, td)
+            return row_by_cid[c]
+        if is_final and not picks:
+            res = solve_simple_trip(matrix, [c for c, _ in drops],
+                                    config["field_id"], config["parking_id"])
+            if res is None:
+                raise ValueError(f"Couldn't re-solve {driver_name}{td} — run a full re-optimization.")
+            route_ids, _tot = res
+            ordered = [c for c in route_ids if c in row_by_cid or c == new_a["customer_id"]]
+        else:
+            res = solve_interleaved_trip(matrix, drops, picks, config["field_id"],
+                                         config["field_id"], capacity, load)
+            if res is None:
+                res = solve_interleaved_trip(matrix, drops, picks, config["field_id"],
+                                             config["field_id"], capacity + 4, load)
+            if res is None:
+                raise ValueError(
+                    f"Couldn't re-solve {driver_name}{td} within capacity — run a full re-optimization."
+                )
+            route, _tot = res
+            ordered = [loc for loc, _l, act in route if act in ("DROP OFF", "PICK UP")]
+        # replace the block: keep first anchor row in place, rebuild the rest after it
+        for i in idxs[1:]:
+            deleted.add(i)
+        inserts.setdefault(idxs[0], [])
+        inserts[idxs[0]] = [row_for(c) for c in ordered] + [anchor_last] + inserts[idxs[0]]
+        touched_trips.add(td)
+
     for cid in new_cids:
         a = sched_by_cid[cid][0]
         pu, do = a["pickup_group"], a["dropoff_group"]
@@ -813,12 +888,18 @@ def _surgical_compute(rows, matrix, driver_name, config, assignments, schedule_l
                     f"Adding {a['dog_name'] or cid} would exceed capacity in {driver_name}{mid} — "
                     f"run a full re-optimization."
                 )
+        if cid not in matrix:
+            raise ValueError(
+                f"{a['dog_name'] or cid} isn't in the distance matrix yet — wait for the "
+                f"matrix update (or run it manually), then try again."
+            )
         prev_name, cost = insert(tp, make_row(a, tp), a["dog_count"], True,
                                  a["dog_name"] or cid)
-        insert(td, make_row(a, td), a["dog_count"], False, a["dog_name"] or cid)
+        _resolve_dropoff_trip(td, a)
         report.append(
             f"{a['dog_name'] or cid}: picked up right after {prev_name} in {driver_name}{tp} "
-            f"(+{cost:.1f} min) — no other stops moved. Drop-off auto-placed in {driver_name}{td}."
+            f"(+{cost:.1f} min) — no other pickups moved. {driver_name}{td} drop-offs "
+            f"re-optimized to fit the new drop."
         )
 
     # ── assemble final rows ──
@@ -846,7 +927,7 @@ def _surgical_compute(rows, matrix, driver_name, config, assignments, schedule_l
 
 
 def surgical_apply(client, sheet_name, matrix, driver_name, config, assignments,
-                   schedule_lookup, selected_date):
+                   schedule_lookup, selected_date, target_cid=None):
     """Sheet wrapper around _surgical_compute. All validation happens BEFORE the tab
     is rewritten, so refusals never destroy existing routes."""
     sheet = client.open(sheet_name)
@@ -860,7 +941,7 @@ def surgical_apply(client, sheet_name, matrix, driver_name, config, assignments,
     rows = [list(r) + [""] * (11 - len(r)) for r in data[2:]]
 
     final_rows, report = _surgical_compute(
-        rows, matrix, driver_name, config, assignments, schedule_lookup
+        rows, matrix, driver_name, config, assignments, schedule_lookup, target_cid=target_cid
     )
     if final_rows is None:
         return []
@@ -990,6 +1071,54 @@ def save_snapshot(client, sheet_name, assignments):
     for a in assignments:
         rows.append([a["driver"], a["customer_id"], a["raw"], a["dog_count"]])
 
+    ws = sheet.add_worksheet(title=SNAPSHOT_TAB_NAME, rows=len(rows), cols=4)
+    ws.update(range_name="A1", values=rows)
+
+
+def update_snapshot_for_driver(client, sheet_name, assignments, driver_name):
+    """Refresh the snapshot for ONE driver (after a surgical update) so change
+    detection stops flagging changes that were already handled surgically,
+    while other drivers' pending changes stay visible."""
+    sheet = client.open(sheet_name)
+    try:
+        ws = sheet.worksheet(SNAPSHOT_TAB_NAME)
+        data = ws.get_all_values()
+    except gspread.exceptions.WorksheetNotFound:
+        save_snapshot(client, sheet_name, assignments)
+        return
+    rows = [["Driver", "Customer ID", "Assignment", "Dog Count"]]
+    for row in data[1:]:
+        if row and row[0].strip() and row[0].strip() != driver_name:
+            rows.append(list(row)[:4] + [""] * max(0, 4 - len(row)))
+    for a in assignments:
+        if a["driver"] == driver_name:
+            rows.append([a["driver"], a["customer_id"], a["raw"], a["dog_count"]])
+    sheet.del_worksheet(ws)
+    ws = sheet.add_worksheet(title=SNAPSHOT_TAB_NAME, rows=len(rows), cols=4)
+    ws.update(range_name="A1", values=rows)
+
+
+def update_snapshot_for_dog(client, sheet_name, assignments, driver_name, cid):
+    """Refresh the snapshot for ONE dog after a targeted surgical change, so only that
+    change clears from the banner and the driver's other pending changes stay visible."""
+    sheet = client.open(sheet_name)
+    try:
+        ws = sheet.worksheet(SNAPSHOT_TAB_NAME)
+        data = ws.get_all_values()
+    except gspread.exceptions.WorksheetNotFound:
+        save_snapshot(client, sheet_name, assignments)
+        return
+    rows = [["Driver", "Customer ID", "Assignment", "Dog Count"]]
+    for row in data[1:]:
+        if not row or not row[0].strip():
+            continue
+        if row[0].strip() == driver_name and len(row) > 1 and row[1].strip() == cid:
+            continue  # drop the old snapshot line for this dog
+        rows.append(list(row)[:4] + [""] * max(0, 4 - len(row)))
+    for a in assignments:
+        if a["driver"] == driver_name and a["customer_id"] == cid:
+            rows.append([a["driver"], a["customer_id"], a["raw"], a["dog_count"]])
+    sheet.del_worksheet(ws)
     ws = sheet.add_worksheet(title=SNAPSHOT_TAB_NAME, rows=len(rows), cols=4)
     ws.update(range_name="A1", values=rows)
 
@@ -1754,45 +1883,64 @@ def main():
     st.divider()
     st.subheader("🔧 Surgical Add")
     st.caption(
-        "Apply Schedule changes for ONE driver without reshuffling their existing route — "
-        "for mid-trip changes. Edit the Schedule tab first, hit Refresh Data, then pick the driver. "
-        "New pickups get inserted at the cheapest capacity-safe spot; drop-offs are placed "
-        "automatically. Use the main Optimize button when a full reshuffle is fine."
+        "Apply ONE pending Schedule change without reshuffling routes in progress. "
+        "The pickup is inserted at the cheapest capacity-safe spot (no other pickups move); "
+        "the drop-off trip is re-optimized since it hasn't started. "
+        "Use the main Optimize button when a full reshuffle is fine."
     )
-    surg_driver = st.selectbox("Driver", scheduled_names, key="surgical_driver")
-    if st.button("🪡 Apply schedule changes surgically", key="surgical_btn") and surg_driver:
-        _cfg = drivers.get(surg_driver)
-        if not _cfg or not _cfg["field_id"] or not _cfg["capacity"]:
-            st.error(f"{surg_driver} has no usable Staff row (field/parking/capacity).")
-        else:
-            _surg_lookup = {}
-            for _row in schedule_data[2:]:
-                _cid = _row[6].strip() if len(_row) > 6 else ""
-                if _cid:
-                    _surg_lookup[_cid] = {
-                        "phone": _row[5].strip() if len(_row) > 5 else "",
-                        "customer_name": _row[3].strip() if len(_row) > 3 else "",
-                        "instructions": _row[62].strip() if len(_row) > 62 else "",
-                        "dog_breed": _row[60].strip() if len(_row) > 60 else "",
-                        "house_description": _row[61].strip() if len(_row) > 61 else "",
-                    }
-            with st.spinner(f"Surgically updating {surg_driver}'s route..."):
-                try:
-                    _rep = surgical_apply(
-                        client, SHEET_NAME, matrix, surg_driver, _cfg,
-                        assignments, _surg_lookup, selected_date,
-                    )
-                    if _rep:
-                        for _line in _rep:
-                            st.success(_line)
-                    else:
-                        st.info(f"No differences between the Schedule and {surg_driver}'s current route.")
-                except ValueError as _e:
-                    st.error(str(_e))
-                except Exception as _e:
-                    import traceback
-                    st.error(f"Surgical update failed — routes were NOT rewritten: {_e}\n\n{traceback.format_exc()}")
-
+    _name_by_cid = {}
+    for _row in schedule_data[1:]:
+        _c = _row[6].strip() if len(_row) > 6 else ""
+        if _c:
+            _name_by_cid[_c] = _row[1].strip() if len(_row) > 1 else _c
+    _opts = []
+    if changes:
+        for _drv in sorted(changes.keys()):
+            for _cid, _raw in sorted(changes[_drv].get("added", set())):
+                _nm = _name_by_cid.get(_cid, _cid)
+                _opts.append((f"ADD  {_nm}  →  {_raw}", _drv, _cid))
+            for _cid, _raw in sorted(changes[_drv].get("removed", set())):
+                _nm = _name_by_cid.get(_cid, _cid)
+                _opts.append((f"REMOVE  {_nm}  ({_raw})", _drv, _cid))
+    if not _opts:
+        st.info("No pending schedule changes — nothing to apply surgically.")
+    else:
+        _labels = [o[0] for o in _opts]
+        _sel = st.selectbox("Pending change", _labels, key="surgical_change")
+        if st.button("🪡 Apply this change surgically", key="surgical_btn") and _sel:
+            _label, _drv, _cid = _opts[_labels.index(_sel)]
+            _cfg = drivers.get(_drv)
+            if not _cfg or not _cfg["field_id"] or not _cfg["capacity"]:
+                st.error(f"{_drv} has no usable Staff row (field/parking/capacity).")
+            else:
+                _surg_lookup = {}
+                for _row in schedule_data[2:]:
+                    _c = _row[6].strip() if len(_row) > 6 else ""
+                    if _c:
+                        _surg_lookup[_c] = {
+                            "phone": _row[5].strip() if len(_row) > 5 else "",
+                            "customer_name": _row[3].strip() if len(_row) > 3 else "",
+                            "instructions": _row[62].strip() if len(_row) > 62 else "",
+                            "dog_breed": _row[60].strip() if len(_row) > 60 else "",
+                            "house_description": _row[61].strip() if len(_row) > 61 else "",
+                        }
+                with st.spinner(f"Surgically updating {_drv}'s route..."):
+                    try:
+                        _rep = surgical_apply(
+                            client, SHEET_NAME, matrix, _drv, _cfg,
+                            assignments, _surg_lookup, selected_date, target_cid=_cid,
+                        )
+                        if _rep:
+                            update_snapshot_for_dog(client, SHEET_NAME, assignments, _drv, _cid)
+                            for _line in _rep:
+                                st.success(_line)
+                        else:
+                            st.info("This change already matches the current routes — nothing to do.")
+                    except ValueError as _e:
+                        st.error(str(_e))
+                    except Exception as _e:
+                        import traceback
+                        st.error(f"Surgical update failed — routes were NOT rewritten: {_e}\n\n{traceback.format_exc()}")
 
 
 if __name__ == "__main__":
