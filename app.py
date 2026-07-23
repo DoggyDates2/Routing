@@ -1559,6 +1559,43 @@ def main():
     snapshot = load_snapshot(client, SHEET_NAME)
     changes = detect_changes(assignments, snapshot)
 
+    # ── Self-heal: drop "changes" that the Routes tab already reflects ──
+    # A removal is handled if the dog isn't in the routes; an addition is handled if it
+    # is. Group-changes (same dog in both added and removed) are never auto-cleared.
+    if changes:
+        try:
+            _rt_ws = client.open(SHEET_NAME).worksheet(OUTPUT_TAB_NAME)
+            _rt = _rt_ws.get_all_values()
+            if _rt and _rt[0] and (_rt[0][0] or "").strip() == selected_date:
+                _sheet_cids = {}
+                for _r in _rt[2:]:
+                    if len(_r) > 10 and _r[10].strip() and not ANCHOR_ID_RE.match(_r[10].strip()):
+                        _asn = (_r[0] or "").strip()
+                        _d = _asn.split(":")[0].strip() if ":" in _asn else ""
+                        if _d:
+                            _sheet_cids.setdefault(_d, set()).add(_r[10].strip())
+                for _drv in list(changes.keys()):
+                    _have = _sheet_cids.get(_drv, set())
+                    _added = changes[_drv].get("added", set())
+                    _removed = changes[_drv].get("removed", set())
+                    _added_cids = {c for c, _ in _added}
+                    _removed_cids = {c for c, _ in _removed}
+                    _both = _added_cids & _removed_cids  # group change: keep pending
+                    _done = []
+                    for _cid, _raw in list(_added):
+                        if _cid not in _both and _cid in _have:
+                            _done.append((_cid, _raw, "added"))
+                    for _cid, _raw in list(_removed):
+                        if _cid not in _both and _cid not in _have:
+                            _done.append((_cid, _raw, "removed"))
+                    for _cid, _raw, _kind in _done:
+                        update_snapshot_for_dog(client, SHEET_NAME, assignments, _drv, _cid)
+                        changes[_drv][_kind].discard((_cid, _raw))
+                    if not changes[_drv].get("added") and not changes[_drv].get("removed"):
+                        del changes[_drv]
+        except Exception:
+            pass  # reconciliation is best-effort; never block the app on it
+
     # ── Driver checklist ──
     st.subheader("Select Drivers to Optimize")
 
