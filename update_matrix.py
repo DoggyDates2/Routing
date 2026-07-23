@@ -240,8 +240,15 @@ def _ors_matrix_call(url, headers, payload, log):
     for attempt in (1, 2, 3, 4):
         try:
             resp = _rq.post(url, headers=headers, json=payload, timeout=30)
+            if resp.status_code == 403:
+                _rem = resp.headers.get("x-ratelimit-remaining", "?")
+                _rst = resp.headers.get("x-ratelimit-reset", "?")
+                log(f"    ORS DAILY quota exhausted (403) — remaining: {_rem}, resets: {_rst}. "
+                    f"No retry will help until the 24h window frees up.")
+                return resp
             if resp.status_code == 429 and attempt < 4:
-                log(f"    ORS rate-limited (429) — backing off {waits[attempt]}s (retry {attempt}/3)...")
+                _rem = resp.headers.get("x-ratelimit-remaining", "?")
+                log(f"    ORS rate-limited (429, remaining: {_rem}) — backing off {waits[attempt]}s (retry {attempt}/3)...")
                 _t.sleep(waits[attempt])
                 continue
             return resp
