@@ -2202,10 +2202,15 @@ def main():
                 _opts.append((f"{_raw}  Remove {_nm}", _drv, _cid))
     if not _opts:
         st.info("No pending schedule changes — nothing to apply surgically.")
+    elif len(_opts) > 15:
+        st.info(
+            f"{len(_opts)} pending changes — too many for surgical edits. "
+            f"Run a full optimization with the button above instead."
+        )
     else:
         _checked = []
-        for _label, _drv, _cid in _opts:
-            if st.checkbox(_label, key=f"surg_{_drv}_{_cid}"):
+        for _i, (_label, _drv, _cid) in enumerate(_opts):
+            if st.checkbox(_label, key=f"surg_{_i}_{_drv}_{_cid}"):
                 _checked.append((_label, _drv, _cid))
         if st.button(f"🪡 Apply {len(_checked)} change(s) surgically", key="surgical_btn",
                      disabled=(len(_checked) == 0)):
