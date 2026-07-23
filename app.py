@@ -1221,8 +1221,9 @@ def build_driver_checklist(results):
 # SNAPSHOT & CHANGE DETECTION
 # =============================================================================
 
-def save_snapshot(client, sheet_name, assignments):
-    """Save current assignments for change detection."""
+def save_snapshot(client, sheet_name, assignments, snapshot_date=""):
+    """Save current assignments for change detection. The date this snapshot
+    describes is stored in E1 so a Thursday snapshot never vouches for Friday."""
     sheet = client.open(sheet_name)
     try:
         existing = sheet.worksheet(SNAPSHOT_TAB_NAME)
@@ -1230,11 +1231,11 @@ def save_snapshot(client, sheet_name, assignments):
     except gspread.exceptions.WorksheetNotFound:
         pass
 
-    rows = [["Driver", "Customer ID", "Assignment", "Dog Count"]]
+    rows = [["Driver", "Customer ID", "Assignment", "Dog Count", snapshot_date]]
     for a in assignments:
-        rows.append([a["driver"], a["customer_id"], a["raw"], a["dog_count"]])
+        rows.append([a["driver"], a["customer_id"], a["raw"], a["dog_count"], ""])
 
-    ws = sheet.add_worksheet(title=SNAPSHOT_TAB_NAME, rows=len(rows), cols=4)
+    ws = sheet.add_worksheet(title=SNAPSHOT_TAB_NAME, rows=len(rows), cols=5)
     ws.update(range_name="A1", values=rows)
 
 
@@ -1249,15 +1250,16 @@ def update_snapshot_for_driver(client, sheet_name, assignments, driver_name):
     except gspread.exceptions.WorksheetNotFound:
         save_snapshot(client, sheet_name, assignments)
         return
-    rows = [["Driver", "Customer ID", "Assignment", "Dog Count"]]
+    _snap_date = (data[0][4].strip() if data and data[0] and len(data[0]) > 4 else "")
+    rows = [["Driver", "Customer ID", "Assignment", "Dog Count", _snap_date]]
     for row in data[1:]:
         if row and row[0].strip() and row[0].strip() != driver_name:
             rows.append(list(row)[:4] + [""] * max(0, 4 - len(row)))
     for a in assignments:
         if a["driver"] == driver_name:
-            rows.append([a["driver"], a["customer_id"], a["raw"], a["dog_count"]])
+            rows.append([a["driver"], a["customer_id"], a["raw"], a["dog_count"], ""])
     sheet.del_worksheet(ws)
-    ws = sheet.add_worksheet(title=SNAPSHOT_TAB_NAME, rows=len(rows), cols=4)
+    ws = sheet.add_worksheet(title=SNAPSHOT_TAB_NAME, rows=len(rows), cols=5)
     ws.update(range_name="A1", values=rows)
 
 
@@ -1271,7 +1273,8 @@ def update_snapshot_for_dog(client, sheet_name, assignments, driver_name, cid):
     except gspread.exceptions.WorksheetNotFound:
         save_snapshot(client, sheet_name, assignments)
         return
-    rows = [["Driver", "Customer ID", "Assignment", "Dog Count"]]
+    _snap_date = (data[0][4].strip() if data and data[0] and len(data[0]) > 4 else "")
+    rows = [["Driver", "Customer ID", "Assignment", "Dog Count", _snap_date]]
     for row in data[1:]:
         if not row or not row[0].strip():
             continue
@@ -1280,21 +1283,23 @@ def update_snapshot_for_dog(client, sheet_name, assignments, driver_name, cid):
         rows.append(list(row)[:4] + [""] * max(0, 4 - len(row)))
     for a in assignments:
         if a["driver"] == driver_name and a["customer_id"] == cid:
-            rows.append([a["driver"], a["customer_id"], a["raw"], a["dog_count"]])
+            rows.append([a["driver"], a["customer_id"], a["raw"], a["dog_count"], ""])
     sheet.del_worksheet(ws)
-    ws = sheet.add_worksheet(title=SNAPSHOT_TAB_NAME, rows=len(rows), cols=4)
+    ws = sheet.add_worksheet(title=SNAPSHOT_TAB_NAME, rows=len(rows), cols=5)
     ws.update(range_name="A1", values=rows)
 
 
 def load_snapshot(client, sheet_name):
-    """Load last-optimized snapshot. Returns dict: driver -> set of (customer_id, assignment)."""
+    """Load last-optimized snapshot. Returns (dict, snapshot_date):
+    driver -> set of (customer_id, assignment), and the date it was taken for."""
     try:
         sheet = client.open(sheet_name)
         ws = sheet.worksheet(SNAPSHOT_TAB_NAME)
         data = ws.get_all_values()
     except Exception:
-        return None
+        return None, ""
 
+    snap_date = (data[0][4].strip() if data and data[0] and len(data[0]) > 4 else "")
     snapshot = {}
     for row in data[1:]:
         if len(row) < 3:
@@ -1305,7 +1310,7 @@ def load_snapshot(client, sheet_name):
         if driver not in snapshot:
             snapshot[driver] = set()
         snapshot[driver].add((cid, assignment))
-    return snapshot
+    return snapshot, snap_date
 
 
 def detect_changes(assignments, snapshot):
@@ -1644,7 +1649,25 @@ def main():
         st.error("No dates found for today or later in the Schedule tab.")
         st.stop()
 
-    selected_date = st.selectbox("Select date:", list(available_dates.keys()))
+    # Default date: before 2pm ET -> today's routes; 2pm onward (through the
+    # overnight) -> the next day of service. User's manual pick sticks for the session.
+    from datetime import timedelta as _td, datetime as _dtt
+    try:
+        from zoneinfo import ZoneInfo as _ZI
+        _now_et = _dtt.now(_ZI("America/New_York"))
+    except Exception:
+        _now_et = _dtt.now()
+    _target = _now_et.date() + _td(days=1) if _now_et.hour >= 14 else _now_et.date()
+    _date_labels = list(available_dates.keys())
+    _default_idx = 0
+    for _i, _lbl in enumerate(_date_labels):
+        _d = parse_route_date(_lbl)
+        if _d and _d >= _target:
+            _default_idx = _i
+            break
+    if st.session_state.get("date_select") not in _date_labels:
+        st.session_state["date_select"] = _date_labels[_default_idx]
+    selected_date = st.selectbox("Select date:", _date_labels, key="date_select")
     date_col_idx = available_dates[selected_date]["col_idx"]
 
     # Reset checkboxes when date changes
@@ -1785,16 +1808,29 @@ def main():
             all_matrix_ids = set(matrix.keys())
 
     # ── Load snapshot and detect changes ──
-    snapshot = load_snapshot(client, SHEET_NAME)
+    snapshot, snapshot_date = load_snapshot(client, SHEET_NAME)
+    if snapshot is not None and snapshot_date != selected_date:
+        snapshot = None  # a snapshot from another date says nothing about this one
     changes = detect_changes(assignments, snapshot)
 
     # ── Self-heal: drop "changes" that the Routes tab already reflects ──
     # A removal is handled if the dog isn't in the routes; an addition is handled if it
     # is. Group-changes (same dog in both added and removed) are never auto-cleared.
+    _routes_tab_date = None
+    try:
+        _rt_ws = client.open(SHEET_NAME).worksheet(OUTPUT_TAB_NAME)
+        _rt = _rt_ws.get_all_values()
+        _routes_tab_date = (_rt[0][0] or "").strip() if _rt and _rt[0] else None
+    except Exception:
+        _rt = None
+    if _routes_tab_date and _routes_tab_date != selected_date:
+        st.info(
+            f"📅 The Routes sheet currently holds **{_routes_tab_date}** — "
+            f"{selected_date} hasn't been optimized yet. Run a full optimization to generate it."
+        )
+
     if changes:
         try:
-            _rt_ws = client.open(SHEET_NAME).worksheet(OUTPUT_TAB_NAME)
-            _rt = _rt_ws.get_all_values()
             if _rt and _rt[0] and (_rt[0][0] or "").strip() == selected_date:
                 _sheet_cids = {}
                 for _r in _rt[2:]:
@@ -1885,24 +1921,30 @@ def main():
     else:
         changed_drivers = set()
 
-    # Select All / Select None / Select Changed + Optimize button on same row
+    # Select All / Select None / Select Changed + Optimize button on same row.
+    # on_click callbacks run BEFORE the script re-executes, so the checkbox state
+    # writes are always legal (no manual st.rerun needed) on any Streamlit version.
+    def _set_all_drivers(value):
+        for _d in active_drivers_with_dogs:
+            st.session_state[f"driver_{_d['name']}"] = value
+        st.session_state[f"defaults_applied_{selected_date}"] = True
+
+    def _set_changed_drivers():
+        for _d in active_drivers_with_dogs:
+            st.session_state[f"driver_{_d['name']}"] = _d["name"] in changed_drivers
+        st.session_state[f"defaults_applied_{selected_date}"] = True
+
     btn_col1, btn_col2, btn_col3, btn_col4 = st.columns(4)
     with btn_col1:
-        if st.button("Select All", use_container_width=True):
-            for d in active_drivers_with_dogs:
-                st.session_state[f"driver_{d['name']}"] = True
-            st.rerun()
+        st.button("Select All", use_container_width=True,
+                  on_click=_set_all_drivers, args=(True,))
     with btn_col2:
-        if st.button("Select None", use_container_width=True):
-            for d in active_drivers_with_dogs:
-                st.session_state[f"driver_{d['name']}"] = False
-            st.rerun()
+        st.button("Select None", use_container_width=True,
+                  on_click=_set_all_drivers, args=(False,))
     with btn_col3:
         if changes and changed_drivers:
-            if st.button("Select Changed", use_container_width=True):
-                for d in active_drivers_with_dogs:
-                    st.session_state[f"driver_{d['name']}"] = d["name"] in changed_drivers
-                st.rerun()
+            st.button("Select Changed", use_container_width=True,
+                      on_click=_set_changed_drivers)
 
     # Optimize button placeholder — renders here but triggered after checklist
     optimize_placeholder = st.empty()
@@ -2040,7 +2082,7 @@ def main():
         with st.spinner("Writing routes to Google Sheet..."):
             try:
                 count = write_results_to_sheet(client, SHEET_NAME, all_results, selected_drivers, selected_date)
-                save_snapshot(client, SHEET_NAME, assignments)
+                save_snapshot(client, SHEET_NAME, assignments, snapshot_date=selected_date)
                 st.session_state["write_success"] = f"✅ Wrote {count} total rows to '{OUTPUT_TAB_NAME}' (updated {len(selected_drivers)} drivers, kept others)."
             except Exception as e:
                 import traceback
