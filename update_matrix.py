@@ -38,6 +38,11 @@ def load_matrix_from_drive(creds, matrix_file_name):
         fields="files(id, name)"
     ).execute().get("files", [])
 
+    if len(file_list) > 1:
+        raise ValueError(
+            f"{len(file_list)} files named '{matrix_file_name}' found in Drive — refusing to "
+            f"update any of them. Delete the duplicate(s) so exactly one remains."
+        )
     if not file_list:
         raise ValueError(f"Matrix file '{matrix_file_name}' not found in Drive")
 
@@ -82,6 +87,115 @@ def load_schedule(creds, sheet_id):
     return ws.get_all_values()
 
 
+def parse_lat_lng(lat_raw, lng_raw):
+    """Tolerant coordinate parser: handles European comma decimals (42,3601),
+    both values pasted into one cell (42.36, -71.05), degree symbols, stray
+    spaces/quotes, and swapped lat/lng columns. Returns (lat, lng) or None."""
+    def _clean(v):
+        return (v or "").strip().replace("\u00b0", "").replace("'", "").replace('"', "")
+    lat_s, lng_s = _clean(lat_raw), _clean(lng_raw)
+    if lat_s and not lng_s and "," in lat_s:
+        parts = [p.strip() for p in lat_s.split(",") if p.strip()]
+        if len(parts) == 2:
+            lat_s, lng_s = parts
+    if not lat_s or not lng_s:
+        return None
+    def _to_f(s):
+        s = s.replace(" ", "")
+        if "," in s and "." not in s:
+            s = s.replace(",", ".")
+        else:
+            s = s.replace(",", "")
+        try:
+            return float(s)
+        except ValueError:
+            return None
+    lat, lng = _to_f(lat_s), _to_f(lng_s)
+    if lat is None or lng is None:
+        return None
+    if abs(lat) > 90 and abs(lng) <= 90:
+        lat, lng = lng, lat
+    elif lat < 0 and lng > 0:
+        # US coordinates: lat is positive, lng negative — columns were swapped
+        lat, lng = lng, lat
+    if not (-90 <= lat <= 90 and -180 <= lng <= 180):
+        return None
+    return lat, lng
+
+
+def ors_geocode(address, ors_key):
+    """Geocode a street address via ORS. Returns (lat, lng) or None."""
+    import requests
+    if not address or not ors_key:
+        return None
+    try:
+        r = requests.get(
+            "https://api.openrouteservice.org/geocode/search",
+            params={"api_key": ors_key, "text": address,
+                    "boundary.country": "US", "size": 1},
+            timeout=15,
+        )
+        feats = r.json().get("features", [])
+        if feats:
+            lng, lat = feats[0]["geometry"]["coordinates"]
+            return float(lat), float(lng)
+    except Exception as e:
+        print(f"  Geocode failed for '{address}': {e}")
+    return None
+
+
+def geocode_missing_coords(creds, schedule_data, schedule_sheet_id, matrix, ors_key):
+    """Dogs missing from the matrix AND missing lat/lng: geocode their address
+    (col A) and write coords back into Schedule cols I/J so every downstream
+    step (this run's add, the app, future runs) can see them."""
+    matrix_ids = set(matrix.keys())
+    targets = []
+    for idx, row in enumerate(schedule_data):
+        if idx < 2:
+            continue
+        cid = row[6].strip() if len(row) > 6 else ""
+        lat = row[8].strip() if len(row) > 8 else ""
+        lng = row[9].strip() if len(row) > 9 else ""
+        addr = row[0].strip() if len(row) > 0 else ""
+        if not cid or cid in matrix_ids or parse_lat_lng(lat, lng) is not None or not addr:
+            continue
+        has_assignment = False
+        for col_idx in range(10, min(len(row), 53)):
+            val = row[col_idx].strip()
+            if val and ":" in val and "cancel" not in val.lower():
+                has_assignment = True
+                break
+        if has_assignment:
+            targets.append((idx, cid, addr))
+    if not targets:
+        return 0
+    print(f"\nGeocoding {len(targets)} dog(s) with missing coordinates...")
+    ws = None
+    try:
+        client = gspread.authorize(creds)
+        ws = client.open_by_key(schedule_sheet_id).worksheet("Schedule")
+    except Exception as e:
+        print(f"  Warning: can't open Schedule for write-back: {e}")
+    fixed = 0
+    for idx, cid, addr in targets:
+        res = ors_geocode(addr, ors_key)
+        if res is None:
+            print(f"  ✗ {cid}: could not geocode '{addr}'")
+            continue
+        lat, lng = res
+        schedule_data[idx][8] = str(lat)
+        schedule_data[idx][9] = str(lng)
+        if ws is not None:
+            try:
+                ws.update_cell(idx + 1, 9, lat)
+                ws.update_cell(idx + 1, 10, lng)
+            except Exception as e:
+                print(f"  Warning: write-back failed for {cid}: {e}")
+        print(f"  ✓ {cid}: {addr} -> ({lat}, {lng})")
+        fixed += 1
+    return fixed
+
+
 def find_missing_dogs(matrix, schedule_data):
     """Find dogs in the Schedule that aren't in the matrix."""
     matrix_ids = set(matrix.keys())
@@ -96,8 +210,10 @@ def find_missing_dogs(matrix, schedule_data):
 
         if not cid or cid in matrix_ids or cid in missing:
             continue
-        if not lat or not lng:
+        _ll = parse_lat_lng(lat, lng)
+        if _ll is None:
             continue
+        lat, lng = str(_ll[0]), str(_ll[1])
 
         # Check if this dog has any assignment in any date column
         has_assignment = False
@@ -116,6 +232,27 @@ def find_missing_dogs(matrix, schedule_data):
     return missing
 
 
+def _ors_matrix_call(url, headers, payload, log):
+    """POST to ORS matrix API with one retry on rate-limit (429)."""
+    import time as _t
+    import requests as _rq
+    for attempt in (1, 2):
+        try:
+            resp = _rq.post(url, headers=headers, json=payload, timeout=30)
+            if resp.status_code == 429 and attempt == 1:
+                log("    ORS rate-limited (429) — waiting 5s and retrying...")
+                _t.sleep(5)
+                continue
+            return resp
+        except Exception as e:
+            if attempt == 1:
+                log(f"    ORS request error ({e}) — retrying once...")
+                _t.sleep(2)
+                continue
+            raise
+    return resp
+
+
 def add_dogs_to_matrix(creds, matrix, missing_dogs, schedule_data, file_id, matrix_csv_text, ors_key):
     """Add missing dogs to the matrix using ORS API and upload to Drive."""
     # Get coords for existing matrix entries
@@ -125,10 +262,9 @@ def add_dogs_to_matrix(creds, matrix, missing_dogs, schedule_data, file_id, matr
         lat = row[8].strip() if len(row) > 8 else ""
         lng = row[9].strip() if len(row) > 9 else ""
         if cid in matrix and lat and lng:
-            try:
-                existing_with_coords[cid] = {"lat": float(lat), "lng": float(lng)}
-            except ValueError:
-                continue
+            _ll = parse_lat_lng(lat, lng)
+            if _ll:
+                existing_with_coords[cid] = {"lat": _ll[0], "lng": _ll[1]}
 
     # Also load field/parking coordinates from Locations tab
     try:
@@ -143,10 +279,9 @@ def add_dogs_to_matrix(creds, matrix, missing_dogs, schedule_data, file_id, matr
                 lat = row[1].strip()
                 lng = row[2].strip()
                 if loc_id and lat and lng and loc_id in matrix:
-                    try:
-                        existing_with_coords[loc_id] = {"lat": float(lat), "lng": float(lng)}
-                    except ValueError:
-                        continue
+                    _ll = parse_lat_lng(lat, lng)
+                    if _ll:
+                        existing_with_coords[loc_id] = {"lat": _ll[0], "lng": _ll[1]}
         print(f"  Loaded {sum(1 for k in existing_with_coords if k.endswith('F') or k.endswith('P'))} field/parking coordinates from Locations tab")
     except Exception as e:
         print(f"  Warning: could not load Locations tab: {e}")
@@ -205,17 +340,18 @@ def add_dogs_to_matrix(creds, matrix, missing_dogs, schedule_data, file_id, matr
 
             # New → existing
             try:
-                resp = requests.post(
+                resp = _ors_matrix_call(
                     "https://api.openrouteservice.org/v2/matrix/driving-car",
-                    headers={"Authorization": ors_key, "Content-Type": "application/json"},
-                    json={"locations": locations, "sources": [0],
-                          "destinations": destinations, "metrics": ["duration"]},
-                    timeout=30
+                    {"Authorization": ors_key, "Content-Type": "application/json"},
+                    {"locations": locations, "sources": [0],
+                     "destinations": destinations, "metrics": ["duration"]},
+                    print,
                 )
                 if resp.status_code == 200:
                     durations = resp.json().get("durations", [[]])[0]
                     for i, bid in enumerate(batch_ids):
-                        new_to_existing[bid] = round(durations[i] / 60, 1)
+                        if i < len(durations) and durations[i] is not None:
+                            new_to_existing[bid] = round(durations[i] / 60, 1)
                 else:
                     print(f"    ORS error (new→existing): {resp.status_code}")
             except Exception as e:
@@ -224,22 +360,32 @@ def add_dogs_to_matrix(creds, matrix, missing_dogs, schedule_data, file_id, matr
 
             # Existing → new
             try:
-                resp = requests.post(
+                resp = _ors_matrix_call(
                     "https://api.openrouteservice.org/v2/matrix/driving-car",
-                    headers={"Authorization": ors_key, "Content-Type": "application/json"},
-                    json={"locations": locations, "sources": destinations,
-                          "destinations": [0], "metrics": ["duration"]},
-                    timeout=30
+                    {"Authorization": ors_key, "Content-Type": "application/json"},
+                    {"locations": locations, "sources": destinations,
+                     "destinations": [0], "metrics": ["duration"]},
+                    print,
                 )
                 if resp.status_code == 200:
                     dur_matrix = resp.json().get("durations", [])
                     for i, bid in enumerate(batch_ids):
-                        existing_to_new[bid] = round(dur_matrix[i][0] / 60, 1)
+                        if i < len(dur_matrix) and dur_matrix[i] and dur_matrix[i][0] is not None:
+                            existing_to_new[bid] = round(dur_matrix[i][0] / 60, 1)
                 else:
                     print(f"    ORS error (existing→new): {resp.status_code}")
             except Exception as e:
                 print(f"    ORS request failed: {e}")
             time.sleep(0.5)
+
+        _cov_out = len(new_to_existing)
+        _cov_in = len(existing_to_new)
+        _cov_msg = (f"    {new_id}: computed {_cov_out}/{len(nearby_ids)} outbound, "
+                    f"{_cov_in}/{len(nearby_ids)} inbound distances"
+                    + (" — ⚠️ MOSTLY 9999s WILL BE WRITTEN, check ORS key/quota and coordinates"
+                       if len(nearby_ids) and (_cov_out < len(nearby_ids) // 2 or _cov_in < len(nearby_ids) // 2)
+                       else ""))
+        print(_cov_msg)
 
         # Update CSV
         header.append(new_id)
@@ -306,6 +452,7 @@ def main():
     print(f"Schedule has {len(schedule_data)} rows")
 
     # Find missing
+    geocode_missing_coords(creds, schedule_data, schedule_sheet_id, matrix, ors_key)
     missing = find_missing_dogs(matrix, schedule_data)
 
     if not missing:
@@ -336,10 +483,9 @@ def repair_9999s(creds, matrix, schedule_data, file_id, matrix_text, ors_key):
         lat = row[8].strip() if len(row) > 8 else ""
         lng = row[9].strip() if len(row) > 9 else ""
         if cid and lat and lng:
-            try:
-                coords_lookup[cid] = {"lat": float(lat), "lng": float(lng)}
-            except ValueError:
-                continue
+            _ll = parse_lat_lng(lat, lng)
+            if _ll:
+                coords_lookup[cid] = {"lat": _ll[0], "lng": _ll[1]}
 
     # Load field/parking coords from Locations tab
     try:
@@ -352,10 +498,9 @@ def repair_9999s(creds, matrix, schedule_data, file_id, matrix_text, ors_key):
                 lat = row[1].strip()
                 lng = row[2].strip()
                 if loc_id and lat and lng:
-                    try:
-                        coords_lookup[loc_id] = {"lat": float(lat), "lng": float(lng)}
-                    except ValueError:
-                        continue
+                    _ll = parse_lat_lng(lat, lng)
+                    if _ll:
+                        coords_lookup[loc_id] = {"lat": _ll[0], "lng": _ll[1]}
     except Exception as e:
         print(f"  Warning: could not load Locations tab: {e}")
 
