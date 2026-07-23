@@ -109,6 +109,71 @@ def load_schedule_sheet(_client, sheet_id):
     return ws.get_all_values()
 
 
+@st.cache_data(show_spinner=False, ttl=300)
+def load_birthdays(_client, sheet_name):
+    """Read the Birthdays tab: col B = customer name, col H = birthday date,
+    col K = picture already taken (non-blank). Missing tab -> empty list."""
+    try:
+        ws = _client.open(sheet_name).worksheet("Birthdays")
+        data = ws.get_all_values()
+    except Exception:
+        return []
+    out = []
+    for row in data[1:]:
+        name = row[1].strip() if len(row) > 1 else ""
+        if not name:
+            continue
+        h_raw = row[7].strip() if len(row) > 7 else ""
+        k_filled = bool(row[10].strip()) if len(row) > 10 else False
+        out.append((name.lower(), h_raw, k_filled))
+    return out
+
+
+def parse_route_date(label):
+    """'Thursday July 23' -> date object (current year). None if unparseable."""
+    from datetime import datetime, date
+    try:
+        d = datetime.strptime(label.strip(), "%A %B %d").date()
+        return d.replace(year=date.today().year)
+    except (ValueError, AttributeError):
+        return None
+
+
+def birthday_symbols(bdays, route_date):
+    """Customer name (lower) -> emoji prefix for PICKUP rows.
+    H before route date: nothing (missed — no action).
+    H == route date:  K blank -> birthday cake + gift; K filled -> gift only.
+    H after route date: K blank -> birthday cake (picture still needed); K filled -> nothing."""
+    from datetime import datetime
+    symbols = {}
+    if route_date is None:
+        return symbols
+    for name, h_raw, k_filled in bdays:
+        parsed = None
+        for fmt in ("%m/%d/%Y", "%m/%d/%y", "%m/%d", "%Y-%m-%d",
+                    "%b %d", "%B %d", "%b %d, %Y", "%B %d, %Y"):
+            try:
+                parsed = datetime.strptime(h_raw, fmt).date()
+                if parsed.year == 1900:
+                    parsed = parsed.replace(year=route_date.year)
+                break
+            except ValueError:
+                continue
+        if parsed is None or parsed < route_date:
+            continue
+        if parsed == route_date:
+            sym = "🎁 " if k_filled else "🎂🎁 "
+        else:
+            sym = "" if k_filled else "🎂 "
+        if sym and (name not in symbols or "🎁" in sym):
+            symbols[name] = sym
+    return symbols
+
+
+def strip_birthday_symbols(name):
+    return name.replace("🎂", "").replace("🎁", "").strip()
+
+
 def get_available_dates(schedule_data):
     """Read row 1 of Schedule tab and return future dates from columns K onward."""
     from datetime import datetime, date
@@ -534,7 +599,7 @@ def write_results_to_sheet(client, sheet_name, new_results, optimized_drivers, s
             for row in existing_data[2:]:  # skip date row and header
                 if len(row) > 10 and row[10]:
                     cid = row[10].strip()
-                    existing_name = row[2].strip() if len(row) > 2 else ""
+                    existing_name = strip_birthday_symbols(row[2].strip()) if len(row) > 2 else ""
                     if cid and existing_name:
                         custom_names[cid] = existing_name
 
@@ -560,6 +625,12 @@ def write_results_to_sheet(client, sheet_name, new_results, optimized_drivers, s
         pass
 
     # Build new rows with name preservation
+    try:
+        _bd_syms = birthday_symbols(load_birthdays(client, sheet_name),
+                                    parse_route_date(selected_date))
+    except Exception:
+        _bd_syms = {}
+
     new_rows = []
     for r in new_results:
         driver_trip = f"{r.get('Driver', '')}{r.get('Leg', '')}"
@@ -568,6 +639,10 @@ def write_results_to_sheet(client, sheet_name, new_results, optimized_drivers, s
         dog_name = r.get("Dog Name", "")
         if cid in custom_names and custom_names[cid] != "":
             dog_name = custom_names[cid]
+        if _bd_syms and r.get("Action", "") == "PICK UP":
+            _s = _bd_syms.get(r.get("Customer Name", "").strip().lower(), "")
+            if _s:
+                dog_name = _s + strip_birthday_symbols(dog_name)
 
         new_rows.append([
             r.get("Assignment", ""),
@@ -639,7 +714,7 @@ def rows_to_checklist_results(rows):
     return out
 
 
-def _surgical_compute(rows, matrix, driver_name, config, assignments, schedule_lookup, target_cid=None):
+def _surgical_compute(rows, matrix, driver_name, config, assignments, schedule_lookup, target_cid=None, bday_syms=None):
     """Pure computation: given current sheet rows (row 3+ as lists, padded to 11 cols),
     apply Schedule differences for one driver surgically. Returns (final_rows, report).
     Raises ValueError with a user-facing message on any refusal. Never touches the sheet."""
@@ -925,7 +1000,13 @@ def _surgical_compute(rows, matrix, driver_name, config, assignments, schedule_l
                 f"{a['dog_name'] or cid} isn't in the distance matrix yet — wait for the "
                 f"matrix update (or run it manually), then try again."
             )
-        prev_name, cost, over = insert(tp, make_row(a, tp), a["dog_count"], True,
+        _prow = make_row(a, tp)
+        if bday_syms:
+            _cn = schedule_lookup.get(cid, {}).get("customer_name", "").strip().lower()
+            _s = bday_syms.get(_cn, "")
+            if _s:
+                _prow[2] = _s + _prow[2]
+        prev_name, cost, over = insert(tp, _prow, a["dog_count"], True,
                                        a["dog_name"] or cid)
         _resolve_dropoff_trip(td, a)
         _note = " ⚠️ over capacity — best available spot used." if over else ""
@@ -973,8 +1054,14 @@ def surgical_apply(client, sheet_name, matrix, driver_name, config, assignments,
         raise ValueError("The Routes tab is for a different date — run a full optimization first.")
     rows = [list(r) + [""] * (11 - len(r)) for r in data[2:]]
 
+    try:
+        _bd_syms = birthday_symbols(load_birthdays(client, sheet_name),
+                                    parse_route_date(selected_date))
+    except Exception:
+        _bd_syms = {}
     final_rows, report = _surgical_compute(
-        rows, matrix, driver_name, config, assignments, schedule_lookup, target_cid=target_cid
+        rows, matrix, driver_name, config, assignments, schedule_lookup,
+        target_cid=target_cid, bday_syms=_bd_syms
     )
     if final_rows is None:
         return []
@@ -1013,7 +1100,7 @@ def build_driver_checklist(results):
             continue
         
         # Strip symbols from dog name to get clean name
-        clean_name = raw_name.replace("◼", "").replace("2️⃣", "").replace("3️⃣", "").strip()
+        clean_name = strip_birthday_symbols(raw_name).replace("◼", "").replace("2️⃣", "").replace("3️⃣", "").strip()
         # Remove "X & Y" prefix
         import re as _re
         clean_name = _re.sub(r'^\d+\s*&\s*\d+\s*', '', clean_name).strip()
@@ -1047,7 +1134,7 @@ def build_driver_checklist(results):
             if not cid or not driver or action not in ("PICK UP",):
                 continue
             
-            clean_name = raw_name.replace("2️⃣", "").replace("3️⃣", "").strip()
+            clean_name = strip_birthday_symbols(raw_name).replace("2️⃣", "").replace("3️⃣", "").strip()
             clean_name = _re.sub(r'^\d+\s*&\s*\d+\s*', '', clean_name).strip()
             
             key = (driver, cid, clean_name)
