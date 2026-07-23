@@ -1333,6 +1333,27 @@ def detect_changes(assignments, snapshot):
     return changes
 
 
+def _ors_matrix_call(url, headers, payload, log):
+    """POST to ORS matrix API with one retry on rate-limit (429)."""
+    import time as _t
+    import requests as _rq
+    for attempt in (1, 2):
+        try:
+            resp = _rq.post(url, headers=headers, json=payload, timeout=30)
+            if resp.status_code == 429 and attempt == 1:
+                log("    ORS rate-limited (429) — waiting 5s and retrying...")
+                _t.sleep(5)
+                continue
+            return resp
+        except Exception as e:
+            if attempt == 1:
+                log(f"    ORS request error ({e}) — retrying once...")
+                _t.sleep(2)
+                continue
+            raise
+    return resp
+
+
 def auto_add_to_matrix(client, matrix, missing_dogs, schedule_data):
     """Automatically add missing dogs to the matrix using ORS API."""
     import requests
@@ -1469,37 +1490,50 @@ def auto_add_to_matrix(client, matrix, missing_dogs, schedule_data):
 
             # New → existing
             try:
-                resp = requests.post(
+                resp = _ors_matrix_call(
                     "https://api.openrouteservice.org/v2/matrix/driving-car",
-                    headers={"Authorization": ors_key, "Content-Type": "application/json"},
-                    json={"locations": locations, "sources": [0],
-                          "destinations": destinations, "metrics": ["duration"]},
-                    timeout=30
+                    {"Authorization": ors_key, "Content-Type": "application/json"},
+                    {"locations": locations, "sources": [0],
+                     "destinations": destinations, "metrics": ["duration"]},
+                    st.write,
                 )
                 if resp.status_code == 200:
                     durations = resp.json().get("durations", [[]])[0]
                     for i, bid in enumerate(batch_ids):
-                        new_to_existing[bid] = round(durations[i] / 60, 1)
+                        if i < len(durations) and durations[i] is not None:
+                            new_to_existing[bid] = round(durations[i] / 60, 1)
             except Exception:
                 pass
             _time.sleep(0.5)
 
             # Existing → new
             try:
-                resp = requests.post(
+                resp = _ors_matrix_call(
                     "https://api.openrouteservice.org/v2/matrix/driving-car",
-                    headers={"Authorization": ors_key, "Content-Type": "application/json"},
-                    json={"locations": locations, "sources": destinations,
-                          "destinations": [0], "metrics": ["duration"]},
-                    timeout=30
+                    {"Authorization": ors_key, "Content-Type": "application/json"},
+                    {"locations": locations, "sources": destinations,
+                     "destinations": [0], "metrics": ["duration"]},
+                    st.write,
                 )
                 if resp.status_code == 200:
                     dur_matrix = resp.json().get("durations", [])
                     for i, bid in enumerate(batch_ids):
-                        existing_to_new[bid] = round(dur_matrix[i][0] / 60, 1)
+                        if i < len(dur_matrix) and dur_matrix[i] and dur_matrix[i][0] is not None:
+                            existing_to_new[bid] = round(dur_matrix[i][0] / 60, 1)
             except Exception:
                 pass
             _time.sleep(0.5)
+
+        _cov_out = len(new_to_existing)
+        _cov_in = len(existing_to_new)
+        if len(nearby_ids) and (_cov_out < len(nearby_ids) // 2 or _cov_in < len(nearby_ids) // 2):
+            st.warning(
+                f"⚠️ {new_id}: only computed {_cov_out}/{len(nearby_ids)} outbound and "
+                f"{_cov_in}/{len(nearby_ids)} inbound distances — the rest will be 9999. "
+                f"Check ORS key/quota and coordinates, then re-add this dog."
+            )
+        else:
+            st.write(f"{new_id}: computed {_cov_out}/{len(nearby_ids)} outbound, {_cov_in}/{len(nearby_ids)} inbound distances")
 
         # Update CSV: add column to header
         header.append(new_id)
