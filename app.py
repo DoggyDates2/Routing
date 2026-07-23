@@ -50,6 +50,13 @@ def load_matrix_from_drive(_client, file_name):
     ).execute()
     files = results.get("files", [])
 
+    if len(files) > 1:
+        st.error(
+            f"🛑 {len(files)} files named '{file_name}' found in Drive — refusing to guess "
+            f"which is current. Delete the duplicate(s) in Drive, then Refresh Data."
+        )
+        st.stop()
+
     if not files:
         st.error(f"Could not find '{file_name}' in Google Drive. "
                  "Make sure the file is shared with your service account email.")
@@ -107,6 +114,42 @@ def load_schedule_sheet(_client, sheet_id):
     sheet = _client.open_by_key(sheet_id)
     ws = sheet.worksheet("Schedule")
     return ws.get_all_values()
+
+
+def parse_lat_lng(lat_raw, lng_raw):
+    """Tolerant coordinate parser: handles European comma decimals (42,3601),
+    both values pasted into one cell (42.36, -71.05), degree symbols, stray
+    spaces/quotes, and swapped lat/lng columns. Returns (lat, lng) or None."""
+    def _clean(v):
+        return (v or "").strip().replace("\u00b0", "").replace("'", "").replace('"', "")
+    lat_s, lng_s = _clean(lat_raw), _clean(lng_raw)
+    if lat_s and not lng_s and "," in lat_s:
+        parts = [p.strip() for p in lat_s.split(",") if p.strip()]
+        if len(parts) == 2:
+            lat_s, lng_s = parts
+    if not lat_s or not lng_s:
+        return None
+    def _to_f(s):
+        s = s.replace(" ", "")
+        if "," in s and "." not in s:
+            s = s.replace(",", ".")
+        else:
+            s = s.replace(",", "")
+        try:
+            return float(s)
+        except ValueError:
+            return None
+    lat, lng = _to_f(lat_s), _to_f(lng_s)
+    if lat is None or lng is None:
+        return None
+    if abs(lat) > 90 and abs(lng) <= 90:
+        lat, lng = lng, lat
+    elif lat < 0 and lng > 0:
+        # US coordinates: lat is positive, lng negative — columns were swapped
+        lat, lng = lng, lat
+    if not (-90 <= lat <= 90 and -180 <= lng <= 180):
+        return None
+    return lat, lng
 
 
 @st.cache_data(show_spinner=False, ttl=300)
@@ -1306,11 +1349,10 @@ def auto_add_to_matrix(client, matrix, missing_dogs, schedule_data):
         cid = row[6].strip() if len(row) > 6 else ""
         lat = row[8].strip() if len(row) > 8 else ""
         lng = row[9].strip() if len(row) > 9 else ""
-        if cid in matrix and lat and lng:
-            try:
-                existing_with_coords[cid] = {"lat": float(lat), "lng": float(lng)}
-            except ValueError:
-                continue
+        if cid in matrix:
+            _ll = parse_lat_lng(lat, lng)
+            if _ll:
+                existing_with_coords[cid] = {"lat": _ll[0], "lng": _ll[1]}
 
     # Also load field/parking coordinates from Locations tab
     try:
@@ -1323,10 +1365,9 @@ def auto_add_to_matrix(client, matrix, missing_dogs, schedule_data):
                 lat = row[1].strip()
                 lng = row[2].strip()
                 if loc_id and lat and lng and loc_id in matrix:
-                    try:
-                        existing_with_coords[loc_id] = {"lat": float(lat), "lng": float(lng)}
-                    except ValueError:
-                        continue
+                    _ll = parse_lat_lng(lat, lng)
+                    if _ll:
+                        existing_with_coords[loc_id] = {"lat": _ll[0], "lng": _ll[1]}
     except Exception:
         pass  # Locations tab doesn't exist yet — skip
 
@@ -1354,6 +1395,12 @@ def auto_add_to_matrix(client, matrix, missing_dogs, schedule_data):
         fields="files(id)"
     ).execute().get("files", [])
 
+    if len(file_list) > 1:
+        st.error(
+            f"🛑 {len(file_list)} files named '{matrix_file_name}' in Drive — NOT writing "
+            f"the matrix to avoid updating the wrong file. Delete the duplicate(s) first."
+        )
+        return matrix
     if not file_list:
         st.warning("Could not find matrix file in Drive.")
         return matrix
@@ -1612,19 +1659,31 @@ def main():
     # ── Auto-check for missing dogs and add them ──
     all_matrix_ids = set(matrix.keys())
     missing_dogs = {}
+    missing_no_coords = []
     for a in assignments:
         if a["customer_id"] not in all_matrix_ids and not a["is_staff_dog"]:
             # Get lat/lng from schedule
-            for row in schedule_data[2:]:
+            for _sched_idx, row in enumerate(schedule_data):
+                if _sched_idx < 2:
+                    continue
                 if len(row) > 9 and row[6].strip() == a["customer_id"]:
                     lat = row[8].strip()
                     lng = row[9].strip()
-                    if lat and lng:
-                        try:
-                            missing_dogs[a["customer_id"]] = {"lat": float(lat), "lng": float(lng)}
-                        except ValueError:
-                            pass
+                    _ll = parse_lat_lng(lat, lng)
+                    if _ll:
+                        missing_dogs[a["customer_id"]] = {"lat": _ll[0], "lng": _ll[1]}
                     break
+            if a["customer_id"] not in missing_dogs:
+                _addr = ""
+                _ridx = -1
+                for _sched_idx, row in enumerate(schedule_data):
+                    if _sched_idx >= 2 and len(row) > 6 and row[6].strip() == a["customer_id"]:
+                        _addr = row[0].strip() if len(row) > 0 else ""
+                        _ridx = _sched_idx
+                        break
+                missing_no_coords.append(
+                    (a["customer_id"], a["dog_name"] or a["customer_id"], _addr, _ridx)
+                )
 
     missing_fields_parking = set()
     for d in drivers.values():
@@ -1635,6 +1694,54 @@ def main():
 
     if missing_fields_parking:
         st.warning(f"⚠️ {len(missing_fields_parking)} field/parking IDs not in matrix: {sorted(missing_fields_parking)}. These need to be added manually.")
+
+    if missing_no_coords:
+        _mnc_labels = ", ".join(f"{n} ({c})" for c, n, _a, _i in missing_no_coords)
+        st.error(
+            f"🚫 {len(missing_no_coords)} dog(s) are NOT in the distance matrix and have no "
+            f"lat/lng in the Schedule, so they route with 9999 gaps: {_mnc_labels}"
+        )
+        if st.button(f"📍 Geocode & add {len(missing_no_coords)} dog(s) now", type="secondary"):
+            import requests as _rq
+            _ors_key = st.secrets.get("ors_api_key", "")
+            _geocoded, _failed = {}, []
+            _sched_ws = None
+            try:
+                _sched_ws = client.open_by_key(schedule_sheet_id).worksheet("Schedule")
+            except Exception:
+                pass
+            for _cid, _nm, _addr, _ridx in missing_no_coords:
+                _res = None
+                if _addr and _ors_key:
+                    try:
+                        _r = _rq.get(
+                            "https://api.openrouteservice.org/geocode/search",
+                            params={"api_key": _ors_key, "text": _addr,
+                                    "boundary.country": "US", "size": 1},
+                            timeout=15,
+                        )
+                        _feats = _r.json().get("features", [])
+                        if _feats:
+                            _lng, _lat = _feats[0]["geometry"]["coordinates"]
+                            _res = (float(_lat), float(_lng))
+                    except Exception:
+                        _res = None
+                if _res:
+                    _geocoded[_cid] = {"lat": _res[0], "lng": _res[1]}
+                    if _sched_ws is not None and _ridx >= 0:
+                        try:
+                            _sched_ws.update_cell(_ridx + 1, 9, _res[0])
+                            _sched_ws.update_cell(_ridx + 1, 10, _res[1])
+                        except Exception:
+                            pass
+                else:
+                    _failed.append(f"{_nm} ({_addr or 'no address'})")
+            if _geocoded:
+                matrix = auto_add_to_matrix(client, matrix, _geocoded, schedule_data)
+                all_matrix_ids = set(matrix.keys())
+                st.success(f"📍 Geocoded, saved to Schedule, and added {len(_geocoded)} dog(s) to the matrix. Re-optimize the affected drivers.")
+            if _failed:
+                st.error("Couldn't geocode (check the address in column A): " + ", ".join(_failed))
 
     if missing_dogs:
         st.warning(f"⚠️ {len(missing_dogs)} new dog(s) not in matrix: {', '.join(missing_dogs.keys())}")
