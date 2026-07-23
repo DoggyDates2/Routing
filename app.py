@@ -1360,6 +1360,54 @@ def _ors_matrix_call(url, headers, payload, log):
     return resp
 
 
+def purge_dogs_from_matrix(client, purge_ids):
+    """Remove the given dog IDs (row + column) from matrix.csv in Drive.
+    Used to clean up failed adds so those dogs become re-addable."""
+    import io as _io
+    import csv as _csv
+    from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
+    from google.oauth2.service_account import Credentials as Creds
+
+    creds = Creds.from_service_account_info(
+        st.secrets["gcp_service_account"], scopes=SCOPES
+    )
+    drive = build("drive", "v3", credentials=creds)
+    matrix_file_name = st.secrets.get("matrix_file_name", "matrix.csv")
+    file_list = drive.files().list(
+        q=f"name='{matrix_file_name}' and trashed=false",
+        fields="files(id)"
+    ).execute().get("files", [])
+    if len(file_list) != 1:
+        st.error(f"Expected exactly one '{matrix_file_name}' in Drive, found {len(file_list)} — not purging.")
+        return False
+    file_id = file_list[0]["id"]
+
+    request = drive.files().get_media(fileId=file_id)
+    content = _io.BytesIO()
+    dl = MediaIoBaseDownload(content, request)
+    done = False
+    while not done:
+        _, done = dl.next_chunk()
+    content.seek(0)
+    rows = list(_csv.reader(_io.StringIO(content.read().decode("utf-8-sig"))))
+    hdr = rows[0]
+    purge = set(purge_ids)
+    drop_cols = {i for i, h in enumerate(hdr) if i > 0 and h.strip() in purge}
+    new_rows = [[c for i, c in enumerate(r) if i not in drop_cols]
+                for r in rows if r and r[0].strip() not in purge]
+    if not all(len(r) == len(new_rows[0]) for r in new_rows):
+        st.error("Purge would produce a ragged matrix — aborted, nothing written.")
+        return False
+
+    out = _io.StringIO()
+    _csv.writer(out).writerows(new_rows)
+    media = MediaIoBaseUpload(
+        _io.BytesIO(out.getvalue().encode("utf-8")), mimetype="text/csv", resumable=True
+    )
+    drive.files().update(fileId=file_id, media_body=media).execute()
+    return True
+
+
 def auto_add_to_matrix(client, matrix, missing_dogs, schedule_data):
     """Automatically add missing dogs to the matrix using ORS API."""
     import requests
@@ -1535,11 +1583,11 @@ def auto_add_to_matrix(client, matrix, missing_dogs, schedule_data):
         if len(nearby_ids) and (_cov_out < len(nearby_ids) // 2 or _cov_in < len(nearby_ids) // 2):
             st.warning(
                 f"⚠️ {new_id}: only computed {_cov_out}/{len(nearby_ids)} outbound and "
-                f"{_cov_in}/{len(nearby_ids)} inbound distances — the rest will be 9999. "
-                f"Check ORS key/quota and coordinates, then re-add this dog."
+                f"{_cov_in}/{len(nearby_ids)} inbound distances — NOT added to the matrix. "
+                f"It stays in the missing list; re-add after the ORS quota resets."
             )
-        else:
-            st.write(f"{new_id}: computed {_cov_out}/{len(nearby_ids)} outbound, {_cov_in}/{len(nearby_ids)} inbound distances")
+            continue  # never write a mostly-9999 dog — leave it missing and re-addable
+        st.write(f"{new_id}: computed {_cov_out}/{len(nearby_ids)} outbound, {_cov_in}/{len(nearby_ids)} inbound distances")
 
         # Update CSV: add column to header
         header.append(new_id)
@@ -1716,6 +1764,27 @@ def main():
 
     # ── Auto-check for missing dogs and add them ──
     all_matrix_ids = set(matrix.keys())
+    _damaged_ids = sorted(
+        rid for rid, drow in matrix.items()
+        if not ANCHOR_ID_RE.match(rid) and drow
+        and sum(1 for v in drow.values() if float(v) >= 9000) > len(drow) * 0.5
+    )
+    if _damaged_ids:
+        st.warning(
+            f"🩹 {len(_damaged_ids)} dog(s) in the matrix have mostly-9999 rows from failed "
+            f"adds: {', '.join(_damaged_ids)}. Remove them so they can be re-added cleanly "
+            f"once the ORS quota resets."
+        )
+        if st.button(f"🗑 Remove {len(_damaged_ids)} damaged dog(s) from matrix"):
+            with st.spinner("Purging damaged rows from matrix.csv..."):
+                if purge_dogs_from_matrix(client, _damaged_ids):
+                    st.success(
+                        f"Removed {len(_damaged_ids)} dog(s) from the matrix. They'll appear "
+                        f"in the missing list for re-adding."
+                    )
+                    st.cache_data.clear()
+                    st.rerun()
+
     missing_dogs = {}
     missing_no_coords = []
     for a in assignments:
