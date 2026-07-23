@@ -1966,12 +1966,16 @@ def main():
                             client, SHEET_NAME, matrix, _drv, _cfg,
                             assignments, _surg_lookup, selected_date, target_cid=_cid,
                         )
+                        # Sync the snapshot in BOTH outcomes: routes changed now, or routes
+                        # already matched (handled earlier but never recorded). Either way this
+                        # change is done and must stop appearing in the pending list.
+                        update_snapshot_for_dog(client, SHEET_NAME, assignments, _drv, _cid)
                         if _rep:
-                            update_snapshot_for_dog(client, SHEET_NAME, assignments, _drv, _cid)
                             for _line in _rep:
                                 st.success(_line)
                         else:
-                            st.info(f"{_label}: already matches the current routes — nothing to do.")
+                            st.success(f"{_label}: routes already matched — marked as handled. "
+                                       f"It won't appear in this list after the next refresh.")
                     except ValueError as _e:
                         st.error(f"{_label}: {_e}")
                     except Exception as _e:
