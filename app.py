@@ -643,11 +643,6 @@ def _surgical_compute(rows, matrix, driver_name, config, assignments, schedule_l
     """Pure computation: given current sheet rows (row 3+ as lists, padded to 11 cols),
     apply Schedule differences for one driver surgically. Returns (final_rows, report).
     Raises ValueError with a user-facing message on any refusal. Never touches the sheet."""
-    groups = derive_groups(assignments, driver_name)
-    if not groups:
-        raise ValueError(f"{driver_name} has no groups on the Schedule for this date.")
-    trip_of_pickup = {g: i + 1 for i, g in enumerate(groups)}
-    trip_of_dropoff = {g: i + 2 for i, g in enumerate(groups)}
     capacity = config["capacity"]
 
     trip_re = re.compile(rf"^{re.escape(driver_name)}(\d+)$")
@@ -668,6 +663,42 @@ def _surgical_compute(rows, matrix, driver_name, config, assignments, schedule_l
     for a in my_assignments:
         sched_by_cid.setdefault(a["customer_id"], []).append(a)
 
+    # ── Group→trip mapping derived from the SHEET itself (the sheet is the structure
+    # of record; Staff/Schedule math is not consulted for trip structure) ──
+    first_seen, last_seen = {}, {}
+    for t in sorted(trip_rows):
+        for i in trip_rows[t]:
+            c = (rows[i][10] or "").strip()
+            if c and not ANCHOR_ID_RE.match(c):
+                first_seen.setdefault(c, t)
+                last_seen[c] = t
+    from collections import Counter as _Counter
+    _pv, _dv = {}, {}
+    for c, t in first_seen.items():
+        al = sched_by_cid.get(c)
+        if al:
+            _pv.setdefault(al[0]["pickup_group"], _Counter())[t] += 1
+    for c, t in last_seen.items():
+        al = sched_by_cid.get(c)
+        if al:
+            _dv.setdefault(al[0]["dropoff_group"], _Counter())[t] += 1
+    trip_of_pickup = {g: v.most_common(1)[0][0] for g, v in _pv.items()}
+    trip_of_dropoff = {g: v.most_common(1)[0][0] for g, v in _dv.items()}
+
+    def _clamped_trip(mapping, g, fallback):
+        """Nearest real trip for a group the driver doesn't normally run — deliberate
+        assignments (e.g. a group 1 dog on a 10AM driver) are honored, never refused."""
+        if g in mapping:
+            return mapping[g]
+        known = sorted(mapping)
+        if not known:
+            return fallback
+        if g < known[0]:
+            return mapping[known[0]]
+        if g > known[-1]:
+            return mapping[known[-1]]
+        return mapping[max(k for k in known if k < g)]
+
     sheet_cids = set()
     for idxs in trip_rows.values():
         for i in idxs:
@@ -682,6 +713,12 @@ def _surgical_compute(rows, matrix, driver_name, config, assignments, schedule_l
         removed_cids = [c for c in removed_cids if c == target_cid]
     if not new_cids and not removed_cids:
         return None, []
+
+    if len(new_cids) > 1:
+        raise ValueError(
+            "Multiple new dogs in one surgical pass isn't supported — apply changes "
+            "one at a time (the checkbox list already does this automatically)."
+        )
 
     for c in new_cids:
         if len(sched_by_cid[c]) > 1:
@@ -772,7 +809,7 @@ def _surgical_compute(rows, matrix, driver_name, config, assignments, schedule_l
         start, loads = trip_loads(trip)
         seq_ids = [(rows[i][10] or "").strip() for i in idxs]
         new_id = new_row[10]
-        best = None
+        best, best_any = None, None
         for k in range(len(idxs) - 1):
             a_id, b_id = seq_ids[k], seq_ids[k + 1]
             if not a_id or not b_id:
@@ -780,24 +817,28 @@ def _surgical_compute(rows, matrix, driver_name, config, assignments, schedule_l
             cost = dist(a_id, new_id) + dist(new_id, b_id) - dist(a_id, b_id)
             if cost >= 9000:
                 continue
+            if best_any is None or cost < best_any[1]:
+                best_any = (k, cost)
             if is_pickup:
-                if max(loads[k:]) + cnt > capacity:
-                    continue
+                fits = max(loads[k:]) + cnt <= capacity
             else:
-                if max([start] + loads[: k + 1]) > capacity:
-                    continue
-            if best is None or cost < best[1]:
+                fits = max([start] + loads[: k + 1]) <= capacity
+            if fits and (best is None or cost < best[1]):
                 best = (k, cost)
+        over = False
         if best is None:
-            raise ValueError(
-                f"No capacity-feasible spot for {label} in {driver_name}{trip} "
-                f"(capacity {capacity}) — run a full re-optimization."
-            )
+            if best_any is None:
+                raise ValueError(
+                    f"No usable position for {label} in {driver_name}{trip} — missing "
+                    f"distances in the matrix. Run a full re-optimization."
+                )
+            best = best_any  # capacity is best-effort, never a refusal
+            over = True
         k, cost = best
         inserts.setdefault(idxs[k], []).append(new_row)
         touched_trips.add(trip)
         prev_name = (rows[idxs[k]][2] or "").strip() or "the start of the trip"
-        return prev_name, cost
+        return prev_name, cost, over
 
     def _resolve_dropoff_trip(td, new_a):
         """Fully re-solve the drop-off trip (it hasn't started yet). Existing rows for
@@ -840,7 +881,7 @@ def _surgical_compute(rows, matrix, driver_name, config, assignments, schedule_l
         for c, span in cid_trips.items():
             if min(span) < td <= max(span):
                 load += cnt_of(c)
-        is_final = (td == len(groups) + 1)
+        is_final = (td == max(trip_rows))
         def row_for(c):
             if c == new_a["customer_id"]:
                 return make_row(new_a, td)
@@ -853,14 +894,15 @@ def _surgical_compute(rows, matrix, driver_name, config, assignments, schedule_l
             route_ids, _tot = res
             ordered = [c for c in route_ids if c in row_by_cid or c == new_a["customer_id"]]
         else:
-            res = solve_interleaved_trip(matrix, drops, picks, config["field_id"],
-                                         config["field_id"], capacity, load)
-            if res is None:
+            res = None
+            for _cap in (max(capacity, load), max(capacity + 4, load), load + 99):
                 res = solve_interleaved_trip(matrix, drops, picks, config["field_id"],
-                                             config["field_id"], capacity + 4, load)
+                                             config["field_id"], _cap, load)
+                if res is not None:
+                    break
             if res is None:
                 raise ValueError(
-                    f"Couldn't re-solve {driver_name}{td} within capacity — run a full re-optimization."
+                    f"Couldn't re-solve {driver_name}{td} — run a full re-optimization."
                 )
             route, _tot = res
             ordered = [loc for loc, _l, act in route if act in ("DROP OFF", "PICK UP")]
@@ -874,32 +916,23 @@ def _surgical_compute(rows, matrix, driver_name, config, assignments, schedule_l
     for cid in new_cids:
         a = sched_by_cid[cid][0]
         pu, do = a["pickup_group"], a["dropoff_group"]
-        tp = trip_of_pickup.get(pu)
-        td = trip_of_dropoff.get(do)
-        if tp is None or td is None:
-            raise ValueError(
-                f"{a['dog_name'] or cid}'s groups ({a['raw']}) don't match {driver_name}'s trips — "
-                f"run a full re-optimization."
-            )
-        for mid in range(tp + 1, td):
-            m_start, m_loads = trip_loads(mid)
-            if max([m_start] + m_loads) > capacity:
-                raise ValueError(
-                    f"Adding {a['dog_name'] or cid} would exceed capacity in {driver_name}{mid} — "
-                    f"run a full re-optimization."
-                )
+        tp = _clamped_trip(trip_of_pickup, pu, min(trip_rows))
+        td = _clamped_trip(trip_of_dropoff, do, max(trip_rows))
+        if td <= tp:
+            td = min(tp + 1, max(trip_rows))
         if cid not in matrix:
             raise ValueError(
                 f"{a['dog_name'] or cid} isn't in the distance matrix yet — wait for the "
                 f"matrix update (or run it manually), then try again."
             )
-        prev_name, cost = insert(tp, make_row(a, tp), a["dog_count"], True,
-                                 a["dog_name"] or cid)
+        prev_name, cost, over = insert(tp, make_row(a, tp), a["dog_count"], True,
+                                       a["dog_name"] or cid)
         _resolve_dropoff_trip(td, a)
+        _note = " ⚠️ over capacity — best available spot used." if over else ""
         report.append(
             f"{a['dog_name'] or cid}: picked up right after {prev_name} in {driver_name}{tp} "
             f"(+{cost:.1f} min) — no other pickups moved. {driver_name}{td} drop-offs "
-            f"re-optimized to fit the new drop."
+            f"re-optimized to fit the new drop.{_note}"
         )
 
     # ── assemble final rows ──
@@ -1883,9 +1916,9 @@ def main():
     st.divider()
     st.subheader("🔧 Surgical Add")
     st.caption(
-        "Apply ONE pending Schedule change without reshuffling routes in progress. "
-        "The pickup is inserted at the cheapest capacity-safe spot (no other pickups move); "
-        "the drop-off trip is re-optimized since it hasn't started. "
+        "Apply pending Schedule changes without reshuffling routes in progress. "
+        "Check the changes to apply: pickups get inserted at the cheapest capacity-safe spot "
+        "(no other pickups move); drop-off trips are re-optimized since they haven't started. "
         "Use the main Optimize button when a full reshuffle is fine."
     )
     _name_by_cid = {}
@@ -1897,34 +1930,37 @@ def main():
     if changes:
         for _drv in sorted(changes.keys()):
             for _cid, _raw in sorted(changes[_drv].get("added", set())):
-                _nm = _name_by_cid.get(_cid, _cid)
-                _opts.append((f"ADD  {_nm}  →  {_raw}", _drv, _cid))
+                _nm = _name_by_cid.get(_cid, _cid)[:10]
+                _opts.append((f"{_raw}  Add {_nm}", _drv, _cid))
             for _cid, _raw in sorted(changes[_drv].get("removed", set())):
-                _nm = _name_by_cid.get(_cid, _cid)
-                _opts.append((f"REMOVE  {_nm}  ({_raw})", _drv, _cid))
+                _nm = _name_by_cid.get(_cid, _cid)[:10]
+                _opts.append((f"{_raw}  Remove {_nm}", _drv, _cid))
     if not _opts:
         st.info("No pending schedule changes — nothing to apply surgically.")
     else:
-        _labels = [o[0] for o in _opts]
-        _sel = st.selectbox("Pending change", _labels, key="surgical_change")
-        if st.button("🪡 Apply this change surgically", key="surgical_btn") and _sel:
-            _label, _drv, _cid = _opts[_labels.index(_sel)]
-            _cfg = drivers.get(_drv)
-            if not _cfg or not _cfg["field_id"] or not _cfg["capacity"]:
-                st.error(f"{_drv} has no usable Staff row (field/parking/capacity).")
-            else:
-                _surg_lookup = {}
-                for _row in schedule_data[2:]:
-                    _c = _row[6].strip() if len(_row) > 6 else ""
-                    if _c:
-                        _surg_lookup[_c] = {
-                            "phone": _row[5].strip() if len(_row) > 5 else "",
-                            "customer_name": _row[3].strip() if len(_row) > 3 else "",
-                            "instructions": _row[62].strip() if len(_row) > 62 else "",
-                            "dog_breed": _row[60].strip() if len(_row) > 60 else "",
-                            "house_description": _row[61].strip() if len(_row) > 61 else "",
-                        }
-                with st.spinner(f"Surgically updating {_drv}'s route..."):
+        _checked = []
+        for _label, _drv, _cid in _opts:
+            if st.checkbox(_label, key=f"surg_{_drv}_{_cid}"):
+                _checked.append((_label, _drv, _cid))
+        if st.button(f"🪡 Apply {len(_checked)} change(s) surgically", key="surgical_btn",
+                     disabled=(len(_checked) == 0)):
+            _surg_lookup = {}
+            for _row in schedule_data[2:]:
+                _c = _row[6].strip() if len(_row) > 6 else ""
+                if _c:
+                    _surg_lookup[_c] = {
+                        "phone": _row[5].strip() if len(_row) > 5 else "",
+                        "customer_name": _row[3].strip() if len(_row) > 3 else "",
+                        "instructions": _row[62].strip() if len(_row) > 62 else "",
+                        "dog_breed": _row[60].strip() if len(_row) > 60 else "",
+                        "house_description": _row[61].strip() if len(_row) > 61 else "",
+                    }
+            for _label, _drv, _cid in _checked:
+                _cfg = drivers.get(_drv)
+                if not _cfg or not _cfg["field_id"] or not _cfg["capacity"]:
+                    st.error(f"{_label}: {_drv} has no usable Staff row — skipped.")
+                    continue
+                with st.spinner(f"Applying: {_label}..."):
                     try:
                         _rep = surgical_apply(
                             client, SHEET_NAME, matrix, _drv, _cfg,
@@ -1935,12 +1971,12 @@ def main():
                             for _line in _rep:
                                 st.success(_line)
                         else:
-                            st.info("This change already matches the current routes — nothing to do.")
+                            st.info(f"{_label}: already matches the current routes — nothing to do.")
                     except ValueError as _e:
-                        st.error(str(_e))
+                        st.error(f"{_label}: {_e}")
                     except Exception as _e:
                         import traceback
-                        st.error(f"Surgical update failed — routes were NOT rewritten: {_e}\n\n{traceback.format_exc()}")
+                        st.error(f"{_label}: failed — routes NOT rewritten for this change: {_e}\n\n{traceback.format_exc()}")
 
 
 if __name__ == "__main__":
