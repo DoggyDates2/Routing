@@ -236,18 +236,19 @@ def _ors_matrix_call(url, headers, payload, log):
     """POST to ORS matrix API with one retry on rate-limit (429)."""
     import time as _t
     import requests as _rq
-    for attempt in (1, 2):
+    waits = {1: 5, 2: 20, 3: 45}
+    for attempt in (1, 2, 3, 4):
         try:
             resp = _rq.post(url, headers=headers, json=payload, timeout=30)
-            if resp.status_code == 429 and attempt == 1:
-                log("    ORS rate-limited (429) — waiting 5s and retrying...")
-                _t.sleep(5)
+            if resp.status_code == 429 and attempt < 4:
+                log(f"    ORS rate-limited (429) — backing off {waits[attempt]}s (retry {attempt}/3)...")
+                _t.sleep(waits[attempt])
                 continue
             return resp
         except Exception as e:
-            if attempt == 1:
-                log(f"    ORS request error ({e}) — retrying once...")
-                _t.sleep(2)
+            if attempt < 4:
+                log(f"    ORS request error ({e}) — retrying in {waits[attempt]}s...")
+                _t.sleep(waits[attempt])
                 continue
             raise
     return resp
@@ -356,7 +357,7 @@ def add_dogs_to_matrix(creds, matrix, missing_dogs, schedule_data, file_id, matr
                     print(f"    ORS error (new→existing): {resp.status_code}")
             except Exception as e:
                 print(f"    ORS request failed: {e}")
-            time.sleep(0.5)
+            time.sleep(2.0)
 
             # Existing → new
             try:
@@ -376,7 +377,7 @@ def add_dogs_to_matrix(creds, matrix, missing_dogs, schedule_data, file_id, matr
                     print(f"    ORS error (existing→new): {resp.status_code}")
             except Exception as e:
                 print(f"    ORS request failed: {e}")
-            time.sleep(0.5)
+            time.sleep(2.0)
 
         _cov_out = len(new_to_existing)
         _cov_in = len(existing_to_new)
@@ -597,7 +598,7 @@ def repair_9999s(creds, matrix, schedule_data, file_id, matrix_text, ors_key):
             except Exception:
                 pass
 
-            time.sleep(0.5)
+            time.sleep(2.0)
 
     if fixed > 0:
         print(f"  Fixed {fixed} entries. Uploading...")
