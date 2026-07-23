@@ -1337,18 +1337,19 @@ def _ors_matrix_call(url, headers, payload, log):
     """POST to ORS matrix API with one retry on rate-limit (429)."""
     import time as _t
     import requests as _rq
-    for attempt in (1, 2):
+    waits = {1: 5, 2: 20, 3: 45}
+    for attempt in (1, 2, 3, 4):
         try:
             resp = _rq.post(url, headers=headers, json=payload, timeout=30)
-            if resp.status_code == 429 and attempt == 1:
-                log("    ORS rate-limited (429) — waiting 5s and retrying...")
-                _t.sleep(5)
+            if resp.status_code == 429 and attempt < 4:
+                log(f"    ORS rate-limited (429) — backing off {waits[attempt]}s (retry {attempt}/3)...")
+                _t.sleep(waits[attempt])
                 continue
             return resp
         except Exception as e:
-            if attempt == 1:
-                log(f"    ORS request error ({e}) — retrying once...")
-                _t.sleep(2)
+            if attempt < 4:
+                log(f"    ORS request error ({e}) — retrying in {waits[attempt]}s...")
+                _t.sleep(waits[attempt])
                 continue
             raise
     return resp
@@ -1504,7 +1505,7 @@ def auto_add_to_matrix(client, matrix, missing_dogs, schedule_data):
                             new_to_existing[bid] = round(durations[i] / 60, 1)
             except Exception:
                 pass
-            _time.sleep(0.5)
+            _time.sleep(2.0)
 
             # Existing → new
             try:
@@ -1522,7 +1523,7 @@ def auto_add_to_matrix(client, matrix, missing_dogs, schedule_data):
                             existing_to_new[bid] = round(dur_matrix[i][0] / 60, 1)
             except Exception:
                 pass
-            _time.sleep(0.5)
+            _time.sleep(2.0)
 
         _cov_out = len(new_to_existing)
         _cov_in = len(existing_to_new)
