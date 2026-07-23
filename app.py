@@ -230,10 +230,10 @@ def parse_staff(data):
         parking_id = row[7].strip()
         capacity_str = row[8].strip()
 
-        if status == "OFF" or not field_id or not capacity_str:
+        if not name:
             continue
 
-        capacity = int(capacity_str)
+        capacity = int(capacity_str) if capacity_str.isdigit() else 0
 
         drivers[name] = {
             "field_id": field_id,
@@ -1055,13 +1055,18 @@ def main():
 
     assignments = parse_schedule(schedule_data, date_col_idx)
 
-    st.sidebar.markdown(f"**Active drivers:** {len(drivers)}")
+    scheduled_names = sorted(set(a["driver"] for a in assignments if a.get("driver")))
+    st.sidebar.markdown(f"**Drivers on schedule:** {len(scheduled_names)}")
     st.sidebar.markdown(f"**Dog assignments:** {len(assignments)}")
 
-    # ── Build driver info ──
+    # ── Build driver info (Schedule tab is the source of truth) ──
     active_drivers_with_dogs = []
-    for name in sorted(drivers.keys()):
-        config = drivers[name]
+    missing_staff_info = []
+    for name in scheduled_names:
+        config = drivers.get(name)
+        if not config or not config["field_id"] or not config["capacity"]:
+            missing_staff_info.append(name)
+            continue
         # Derive groups from actual assignments, not Staff tab
         config["groups"] = derive_groups(assignments, name)
         dogs = [a for a in assignments if a["driver"] == name]
@@ -1075,6 +1080,13 @@ def main():
                 "dogs": dog_count,
                 "staff_dogs": staff_count,
             })
+
+    if missing_staff_info:
+        st.warning(
+            "These drivers are on the Schedule for this date but have no usable Staff row "
+            "(missing field, parking, or capacity) and were skipped: "
+            + ", ".join(missing_staff_info)
+        )
 
     # ── Auto-check for missing dogs and add them ──
     all_matrix_ids = set(matrix.keys())
