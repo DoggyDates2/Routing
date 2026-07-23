@@ -1373,6 +1373,7 @@ def purge_dogs_from_matrix(client, purge_ids):
     import io as _io
     import csv as _csv
     from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
+    from googleapiclient.discovery import build
     from google.oauth2.service_account import Credentials as Creds
 
     creds = Creds.from_service_account_info(
