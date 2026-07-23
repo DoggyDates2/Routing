@@ -1338,6 +1338,9 @@ def detect_changes(assignments, snapshot):
     return changes
 
 
+_ORS_QUOTA_HIT = {"v": False}
+
+
 def _ors_matrix_call(url, headers, payload, log):
     """POST to ORS matrix API with one retry on rate-limit (429)."""
     import time as _t
@@ -1347,10 +1350,11 @@ def _ors_matrix_call(url, headers, payload, log):
         try:
             resp = _rq.post(url, headers=headers, json=payload, timeout=30)
             if resp.status_code == 403:
+                _ORS_QUOTA_HIT["v"] = True
                 _rem = resp.headers.get("x-ratelimit-remaining", "?")
                 _rst = resp.headers.get("x-ratelimit-reset", "?")
                 log(f"    ORS DAILY quota exhausted (403) — remaining: {_rem}, resets: {_rst}. "
-                    f"No retry will help until the 24h window frees up.")
+                    f"Aborting remaining ORS work for this run.")
                 return resp
             if resp.status_code == 429 and attempt < 4:
                 _rem = resp.headers.get("x-ratelimit-remaining", "?")
@@ -1508,7 +1512,15 @@ def auto_add_to_matrix(client, matrix, missing_dogs, schedule_data):
     total = len(missing_dogs)
     completed = 0
 
+    _ORS_QUOTA_HIT["v"] = False  # fresh run, fresh verdict
     for new_id, new_coords in missing_dogs.items():
+        if _ORS_QUOTA_HIT["v"]:
+            st.error(
+                "🛑 Daily ORS quota exhausted — skipping the remaining dogs. Any dog that "
+                "completed fully is kept; nothing partial is written. Try again after the "
+                "quota window frees up (or let the scheduled runs handle it)."
+            )
+            break
         completed += 1
         progress.progress(completed / total, text=f"Adding {new_id} ({completed}/{total})...")
 
@@ -1545,6 +1557,8 @@ def auto_add_to_matrix(client, matrix, missing_dogs, schedule_data):
             text=f"Adding {new_id} ({completed}/{total}) — {len(nearby_ids)} nearby locations...")
 
         for batch_start in range(0, len(nearby_ids), batch_size):
+            if _ORS_QUOTA_HIT["v"]:
+                break
             batch_ids = nearby_ids[batch_start:batch_start + batch_size]
             batch_coords = nearby_coords[batch_start:batch_start + batch_size]
             locations = [new_loc] + batch_coords
