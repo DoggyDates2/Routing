@@ -1268,6 +1268,8 @@ def save_snapshot(client, sheet_name, assignments, snapshot_date=""):
 
     rows = [["Driver", "Customer ID", "Assignment", "Dog Count", snapshot_date]]
     for a in assignments:
+        if a.get("is_staff_dog"):
+            continue
         rows.append([a["driver"], a["customer_id"], a["raw"], a["dog_count"], ""])
 
     ws = sheet.add_worksheet(title=SNAPSHOT_TAB_NAME, rows=len(rows), cols=5)
@@ -1291,7 +1293,7 @@ def update_snapshot_for_driver(client, sheet_name, assignments, driver_name):
         if row and row[0].strip() and row[0].strip() != driver_name:
             rows.append(list(row)[:4] + [""] * max(0, 4 - len(row)))
     for a in assignments:
-        if a["driver"] == driver_name:
+        if a["driver"] == driver_name and not a.get("is_staff_dog"):
             rows.append([a["driver"], a["customer_id"], a["raw"], a["dog_count"], ""])
     sheet.del_worksheet(ws)
     ws = sheet.add_worksheet(title=SNAPSHOT_TAB_NAME, rows=len(rows), cols=5)
@@ -1317,7 +1319,7 @@ def update_snapshot_for_dog(client, sheet_name, assignments, driver_name, cid):
             continue  # drop the old snapshot line for this dog
         rows.append(list(row)[:4] + [""] * max(0, 4 - len(row)))
     for a in assignments:
-        if a["driver"] == driver_name and a["customer_id"] == cid:
+        if a["driver"] == driver_name and a["customer_id"] == cid and not a.get("is_staff_dog"):
             rows.append([a["driver"], a["customer_id"], a["raw"], a["dog_count"], ""])
     sheet.del_worksheet(ws)
     ws = sheet.add_worksheet(title=SNAPSHOT_TAB_NAME, rows=len(rows), cols=5)
@@ -1355,6 +1357,8 @@ def detect_changes(assignments, snapshot):
 
     current = {}
     for a in assignments:
+        if a.get("is_staff_dog"):
+            continue  # staff dogs are never routed — not a routable change
         driver = a["driver"]
         if driver not in current:
             current[driver] = set()
