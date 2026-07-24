@@ -1527,7 +1527,7 @@ def auto_add_to_matrix(client, matrix, missing_dogs, schedule_data):
         new_loc = [new_coords["lng"], new_coords["lat"]]
         new_to_existing = {}
         existing_to_new = {}
-        batch_size = 25
+        batch_size = 45
 
         # Only compute ORS distances to dogs within 10 miles (haversine pre-filter)
         import math
@@ -1841,6 +1841,7 @@ def main():
         if d["parking_id"] not in all_matrix_ids:
             missing_fields_parking.add(d["parking_id"])
 
+    missing_fields_parking.discard("")  # blank Staff cells are flagged by the no-usable-Staff-row warning, not here
     if missing_fields_parking:
         st.warning(f"⚠️ {len(missing_fields_parking)} field/parking IDs not in matrix: {sorted(missing_fields_parking)}. These need to be added manually.")
 
