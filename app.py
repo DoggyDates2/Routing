@@ -248,6 +248,24 @@ def is_front_dog(name):
     return "FRNT" in (name or "").upper()
 
 
+def strip_display_prefixes(name):
+    """Strip route display decorations (birthday symbols, dropoff ◼, split-trip
+    2️⃣/3️⃣) to recover the base dog name. Real name emojis (💩 etc.) are kept."""
+    nm = name or ""
+    changed = True
+    while changed:
+        changed = False
+        nm2 = strip_birthday_symbols(nm)
+        if nm2 != nm:
+            nm, changed = nm2, True
+        for tok in ("◼", "2️⃣", "3️⃣"):
+            if nm.startswith(tok):
+                nm, changed = nm[len(tok):], True
+        if nm != nm.lstrip():
+            nm, changed = nm.lstrip(), True
+    return nm.strip()
+
+
 def strip_birthday_symbols(name):
     return name.replace("🎂", "").replace("🎁", "").strip()
 
@@ -824,7 +842,12 @@ def write_results_to_sheet(client, sheet_name, new_results, optimized_drivers, s
             for row in existing_data[2:]:  # skip date row and header
                 if len(row) > 10 and row[10]:
                     cid = row[10].strip()
-                    existing_name = strip_birthday_symbols(row[2].strip()) if len(row) > 2 else ""
+                    # Anchor rows (fields/parking) must never override each other's
+                    # labels; and strip display decorations (◼/2️⃣/3️⃣/birthday) so a
+                    # drop-off row's "◼Chico" can't get stamped onto pickup rows.
+                    if cid and ANCHOR_ID_RE.match(cid):
+                        continue
+                    existing_name = strip_display_prefixes(row[2].strip()) if len(row) > 2 else ""
                     if cid and existing_name:
                         custom_names[cid] = existing_name
 
@@ -858,8 +881,12 @@ def write_results_to_sheet(client, sheet_name, new_results, optimized_drivers, s
         cid = r.get("Customer ID", "")
         
         dog_name = r.get("Dog Name", "")
-        if cid in custom_names and custom_names[cid] != "":
-            dog_name = custom_names[cid]
+        _base = strip_display_prefixes(dog_name)
+        if (cid in custom_names and custom_names[cid] != ""
+                and _base and dog_name.endswith(_base)
+                and custom_names[cid] != _base):
+            _prefix = dog_name[: len(dog_name) - len(_base)]
+            dog_name = _prefix + custom_names[cid]  # manual edit, row's own ◼ etc. kept
         if _bd_syms and r.get("Action", "") == "PICK UP":
             _s = _bd_syms.get(r.get("Customer Name", "").strip().lower(), "")
             if _s:
