@@ -934,7 +934,7 @@ def rows_to_checklist_results(rows):
     return out
 
 
-def _surgical_compute(rows, matrix, driver_name, config, assignments, schedule_lookup, target_cid=None, bday_syms=None, pickup_mode="insert", removal_mode="surgical"):
+def _surgical_compute(rows, matrix, driver_name, config, assignments, schedule_lookup, target_cid=None, bday_syms=None):
     """Pure computation: given current sheet rows (row 3+ as lists, padded to 11 cols),
     apply Schedule differences for one driver surgically. Returns (final_rows, report).
     Raises ValueError with a user-facing message on any refusal. Never touches the sheet."""
@@ -1070,20 +1070,17 @@ def _surgical_compute(rows, matrix, driver_name, config, assignments, schedule_l
     removed_set = set(removed_cids)
     deleted = set()
 
-    removed_trips = {}  # cid -> set of trips it was deleted from
     if removed_cids:
         removed_names = []
         for t, idxs in list(trip_rows.items()):
             keep = []
             for i in idxs:
-                _rc = (rows[i][10] or "").strip()
-                if _rc in removed_set:
-                    nm = (rows[i][2] or "").strip() or _rc
+                if (rows[i][10] or "").strip() in removed_set:
+                    nm = (rows[i][2] or "").strip() or (rows[i][10] or "").strip()
                     if nm not in removed_names:
                         removed_names.append(nm)
                     deleted.add(i)
                     touched_trips.add(t)
-                    removed_trips.setdefault(_rc, set()).add(t)
                 else:
                     keep.append(i)
             trip_rows[t] = keep
@@ -1249,12 +1246,9 @@ def _surgical_compute(rows, matrix, driver_name, config, assignments, schedule_l
         prev_name = (rows[idxs[k]][2] or "").strip() or "the start of the trip"
         return prev_name, cost, over
 
-    resolved_trips = set()  # trips fully re-solved this pass (never re-solve twice)
-
-    def _resolve_dropoff_trip(td, new_a, new_role="drop"):
-        """Fully re-solve one trip: existing rows are reordered per the solver.
-        new_a is added as a drop-off (default) or a pickup (new_role="pick");
-        new_a=None just re-orders what's left (used after Full-mode removals)."""
+    def _resolve_dropoff_trip(td, new_a):
+        """Fully re-solve the drop-off trip (it hasn't started yet). Existing rows for
+        that trip are reordered per the solver; the new dog's row is added."""
         idxs = trip_rows.get(td)
         if not idxs or len(idxs) < 2:
             raise ValueError(f"Trip {driver_name}{td} not found in the sheet — run a full re-optimization.")
@@ -1288,16 +1282,8 @@ def _surgical_compute(rows, matrix, driver_name, config, assignments, schedule_l
                 picks.append((c, cnt_of(c)))
             else:
                 drops.append((c, cnt_of(c)))
-        if new_a is None:
-            if not row_by_cid:
-                return  # nothing left in this trip to reorder
-            load = staff_load_at(td)
-        elif new_role == "pick":
-            picks.append((new_a["customer_id"], new_a["dog_count"]))
-            load = staff_load_at(td)  # picked up during the trip, not aboard entering
-        else:
-            drops.append((new_a["customer_id"], new_a["dog_count"]))
-            load = staff_load_at(td) + new_a["dog_count"]
+        drops.append((new_a["customer_id"], new_a["dog_count"]))
+        load = staff_load_at(td) + new_a["dog_count"]
         for c, span in cid_trips.items():
             if min(span) < td <= max(span):
                 load += cnt_of(c)
@@ -1330,33 +1316,17 @@ def _surgical_compute(rows, matrix, driver_name, config, assignments, schedule_l
                              front_pick_ids=front_pick_ids,
                              front_initial=front_initial)
         is_final = (td == max(trip_rows))
-        _new_cid = new_a["customer_id"] if new_a else None
-
         def row_for(c):
-            if c == _new_cid:
-                r = make_row(new_a, td)
-                if new_role == "pick" and bday_syms:
-                    _cn = schedule_lookup.get(c, {}).get("customer_name", "").strip().lower()
-                    _s = bday_syms.get(_cn, "")
-                    if _s:
-                        r[2] = _s + r[2]
-                return r
+            if c == new_a["customer_id"]:
+                return make_row(new_a, td)
             return row_by_cid[c]
-        is_first = (td == min(trip_rows))
-        if is_first and not drops:
-            res = solve_simple_trip(matrix, [c for c, _ in picks],
-                                    config["parking_id"], config["field_id"])
-            if res is None:
-                raise ValueError(f"Couldn't re-solve {driver_name}{td} — run a full re-optimization.")
-            route_ids, _tot = res
-            ordered = [c for c in route_ids if c in row_by_cid or c == _new_cid]
-        elif is_final and not picks:
+        if is_final and not picks:
             res = solve_simple_trip(matrix, [c for c, _ in drops],
                                     config["field_id"], config["parking_id"])
             if res is None:
                 raise ValueError(f"Couldn't re-solve {driver_name}{td} — run a full re-optimization.")
             route_ids, _tot = res
-            ordered = [c for c in route_ids if c in row_by_cid or c == _new_cid]
+            ordered = [c for c in route_ids if c in row_by_cid or c == new_a["customer_id"]]
         else:
             res = None
             for _cap in (max(capacity, load), max(capacity + 4, load), load + 99):
@@ -1387,7 +1357,6 @@ def _surgical_compute(rows, matrix, driver_name, config, assignments, schedule_l
         inserts.setdefault(idxs[0], [])
         inserts[idxs[0]] = [row_for(c) for c in ordered] + [anchor_last] + inserts[idxs[0]]
         touched_trips.add(td)
-        resolved_trips.add(td)
 
     for cid in new_cids:
         a = sched_by_cid[cid][0]
@@ -1401,42 +1370,21 @@ def _surgical_compute(rows, matrix, driver_name, config, assignments, schedule_l
                 f"{a['dog_name'] or cid} isn't in the distance matrix yet — wait for the "
                 f"matrix update (or run it manually), then try again."
             )
-        _pick_resolve = (pickup_mode == "resolve") or (
-            removal_mode == "resolve" and tp in removed_trips.get(cid, set())
+        _prow = make_row(a, tp)
+        if bday_syms:
+            _cn = schedule_lookup.get(cid, {}).get("customer_name", "").strip().lower()
+            _s = bday_syms.get(_cn, "")
+            if _s:
+                _prow[2] = _s + _prow[2]
+        prev_name, cost, over = insert(tp, _prow, a["dog_count"], True,
+                                       a["dog_name"] or cid)
+        _resolve_dropoff_trip(td, a)
+        _note = " ⚠️ over capacity — best available spot used." if over else ""
+        report.append(
+            f"{a['dog_name'] or cid}: picked up right after {prev_name} in {driver_name}{tp} "
+            f"(+{cost:.1f} min) — no other pickups moved. {driver_name}{td} drop-offs "
+            f"re-optimized to fit the new drop.{_note}"
         )
-        if _pick_resolve:
-            _resolve_dropoff_trip(tp, a, new_role="pick")
-            _resolve_dropoff_trip(td, a)
-            report.append(
-                f"{a['dog_name'] or cid}: {driver_name}{tp} pickups FULLY re-optimized "
-                f"with the new dog included; {driver_name}{td} drop-offs re-optimized too."
-            )
-        else:
-            _prow = make_row(a, tp)
-            if bday_syms:
-                _cn = schedule_lookup.get(cid, {}).get("customer_name", "").strip().lower()
-                _s = bday_syms.get(_cn, "")
-                if _s:
-                    _prow[2] = _s + _prow[2]
-            prev_name, cost, over = insert(tp, _prow, a["dog_count"], True,
-                                           a["dog_name"] or cid)
-            _resolve_dropoff_trip(td, a)
-            _note = " ⚠️ over capacity — best available spot used." if over else ""
-            report.append(
-                f"{a['dog_name'] or cid}: picked up right after {prev_name} in {driver_name}{tp} "
-                f"(+{cost:.1f} min) — no other pickups moved. {driver_name}{td} drop-offs "
-                f"re-optimized to fit the new drop.{_note}"
-            )
-
-    # ── Full-mode removals: re-optimize the trips the removed dog(s) left,
-    #    unless the insertion above already fully re-solved them ──
-    if removal_mode == "resolve" and removed_trips:
-        for _rc, _trips in sorted(removed_trips.items()):
-            for _t in sorted(_trips):
-                if _t in resolved_trips or len(trip_rows.get(_t, [])) < 3:
-                    continue
-                _resolve_dropoff_trip(_t, None)
-                report.append(f"{driver_name}{_t} fully re-optimized after the removal.")
 
     # ── assemble final rows ──
     final_rows = []
@@ -1463,8 +1411,7 @@ def _surgical_compute(rows, matrix, driver_name, config, assignments, schedule_l
 
 
 def surgical_apply(client, sheet_name, matrix, driver_name, config, assignments,
-                   schedule_lookup, selected_date, target_cid=None, pickup_mode="insert",
-                   removal_mode="surgical"):
+                   schedule_lookup, selected_date, target_cid=None):
     """Sheet wrapper around _surgical_compute. All validation happens BEFORE the tab
     is rewritten, so refusals never destroy existing routes."""
     if not config.get("field_id"):
@@ -1490,8 +1437,7 @@ def surgical_apply(client, sheet_name, matrix, driver_name, config, assignments,
         _bd_syms = {}
     final_rows, report = _surgical_compute(
         rows, matrix, driver_name, config, assignments, schedule_lookup,
-        target_cid=target_cid, bday_syms=_bd_syms, pickup_mode=pickup_mode,
-        removal_mode=removal_mode
+        target_cid=target_cid, bday_syms=_bd_syms
     )
     if final_rows is None:
         return []
@@ -2767,133 +2713,43 @@ def main():
             st.warning(f"🐕 {len(over_capacity)} driver(s) over capacity:")
             st.dataframe(pd.DataFrame(over_capacity), use_container_width=True, hide_index=True)
 
-    # ── Mid-Day Changes by Group ──
+    # ── Surgical Add ──
     st.divider()
-    st.subheader("🔧 Mid-Day Changes by Group")
+    st.subheader("🔧 Surgical Add")
     st.caption(
-        "Pending Schedule changes, organized by pickup group. Per group choose: "
-        "**Full** — that trip is completely re-optimized with the changes included "
-        "(best when the trip hasn't started); **Surgical** — adds slot into the "
-        "cheapest spot / removals just delete the stops, nobody else moves (best "
-        "mid-trip); **Skip** — leave pending. A moved dog shows in BOTH its old and "
-        "new group and needs both set. Drop-off trips are always fully re-optimized."
+        "Apply pending Schedule changes without reshuffling routes in progress. "
+        "Check the changes to apply: pickups get inserted at the cheapest capacity-safe spot "
+        "(no other pickups move); drop-off trips are re-optimized since they haven't started. "
+        "Use the main Optimize button when a full reshuffle is fine."
     )
     _name_by_cid = {}
     for _row in schedule_data[1:]:
         _c = _row[6].strip() if len(_row) > 6 else ""
         if _c:
             _name_by_cid[_c] = _row[1].strip() if len(_row) > 1 else _c
-
-    def _pickup_group_of(raw):
-        _code = raw.split(":", 1)[1] if ":" in (raw or "") else (raw or "")
-        _digits = re.findall(r"\d", _code)
-        return int(_digits[0]) if _digits else None
-
-    # One record per pending change. A moved dog (same dog added+removed) becomes
-    # TWO linked records — the removal under its OLD group and the add under its
-    # NEW group — so each side's style follows that group's Full/Surgical choice.
-    _records = []  # (group, kind, driver, cid, display)
-    _move_groups = {}  # (driver, cid) -> (old_group, new_group)
+    _opts = []
     if changes:
         for _drv in sorted(changes.keys()):
-            _added = dict(changes[_drv].get("added", set()))
-            _removed = dict(changes[_drv].get("removed", set()))
-            _moved = set(_added) & set(_removed)
-            for _cid in sorted(_moved):
-                _go = _pickup_group_of(_removed[_cid])
-                _gn = _pickup_group_of(_added[_cid])
+            for _cid, _raw in sorted(changes[_drv].get("added", set())):
                 _nm = _name_by_cid.get(_cid, _cid)[:10]
-                _move_groups[(_drv, _cid)] = (_go, _gn)
-                _records.append((_go, "move_out", _drv, _cid,
-                                 f"{_removed[_cid]}  Remove {_nm} (moving to {_added[_cid]})"))
-                _records.append((_gn, "move_in", _drv, _cid,
-                                 f"{_added[_cid]}  Add {_nm} (was {_removed[_cid]})"))
-            for _cid, _raw in sorted(_added.items()):
-                if _cid in _moved:
-                    continue
-                _g = _pickup_group_of(_raw)
+                _opts.append((f"{_raw}  Add {_nm}", _drv, _cid))
+            for _cid, _raw in sorted(changes[_drv].get("removed", set())):
                 _nm = _name_by_cid.get(_cid, _cid)[:10]
-                _records.append((_g, "add", _drv, _cid, f"{_raw}  Add {_nm}"))
-            for _cid, _raw in sorted(_removed.items()):
-                if _cid in _moved:
-                    continue
-                _g = _pickup_group_of(_raw)
-                _nm = _name_by_cid.get(_cid, _cid)[:10]
-                _records.append((_g, "remove", _drv, _cid, f"{_raw}  Remove {_nm}"))
-
-    if not _records:
-        st.info("No pending schedule changes — nothing to apply.")
-    elif len(_records) > 15:
+                _opts.append((f"{_raw}  Remove {_nm}", _drv, _cid))
+    if not _opts:
+        st.info("No pending schedule changes — nothing to apply surgically.")
+    elif len(_opts) > 15:
         st.info(
-            f"{len(_records)} pending changes — too many for mid-day edits. "
+            f"{len(_opts)} pending changes — too many for surgical edits. "
             f"Run a full optimization with the button above instead."
         )
     else:
-        _groups_present = sorted(set(g for g, *_ in _records if g is not None))
-        _unknown = [r for r in _records if r[0] is None]
-        _mode_by_group = {}
-        for _g in _groups_present:
-            _grp_recs = [r for r in _records if r[0] == _g]
-            _c1, _c2 = st.columns([1, 3])
-            with _c1:
-                _mode_by_group[_g] = st.radio(
-                    f"**Group {_g}** ({len(_grp_recs)})",
-                    ["Skip", "Full", "Surgical"],
-                    horizontal=True,
-                    key=f"grpmode_{selected_date}_{_g}",
-                )
-            with _c2:
-                st.caption("  \n".join(_lbl for _, _, _, _, _lbl in _grp_recs))
-        if _unknown:
-            st.warning("Couldn't read a pickup group for: "
-                       + ", ".join(r[4] for r in _unknown)
-                       + " — apply these with a full driver optimization.")
-
-        # Build the actual jobs: (driver, cid, label, pickup_mode, removal_mode)
-        _jobs = []
-        _half_set_moves = []
-        _seen_moves = set()
-        for _g, _kind, _drv, _cid, _label in _records:
-            if _g is None:
-                continue
-            if _kind in ("move_out", "move_in"):
-                if (_drv, _cid) in _seen_moves:
-                    continue
-                _seen_moves.add((_drv, _cid))
-                _go, _gn = _move_groups[(_drv, _cid)]
-                if _go is None or _gn is None:
-                    continue  # already covered by the unknown-group warning
-                _mo = _mode_by_group.get(_go, "Skip")
-                _mn = _mode_by_group.get(_gn, "Skip")
-                if _mo == "Skip" or _mn == "Skip":
-                    if _mo != "Skip" or _mn != "Skip":
-                        _nm = _name_by_cid.get(_cid, _cid)[:10]
-                        _half_set_moves.append(
-                            f"{_nm} ({_drv}): needs BOTH group {_go} and group {_gn} "
-                            f"set to Full or Surgical — a move can't be applied halfway."
-                        )
-                    continue
-                _nm = _name_by_cid.get(_cid, _cid)[:10]
-                _jobs.append((_drv, _cid,
-                              f"Move {_nm}: remove={_mo} (group {_go}), add={_mn} (group {_gn})",
-                              "resolve" if _mn == "Full" else "insert",
-                              "resolve" if _mo == "Full" else "surgical"))
-            elif _kind == "add":
-                _m = _mode_by_group.get(_g, "Skip")
-                if _m == "Skip":
-                    continue
-                _jobs.append((_drv, _cid, _label,
-                              "resolve" if _m == "Full" else "insert", "surgical"))
-            else:  # remove
-                _m = _mode_by_group.get(_g, "Skip")
-                if _m == "Skip":
-                    continue
-                _jobs.append((_drv, _cid, _label,
-                              "insert", "resolve" if _m == "Full" else "surgical"))
-        for _msg in _half_set_moves:
-            st.info("↔️ " + _msg)
-        if st.button(f"🪡 Apply {len(_jobs)} change(s)", key="surgical_btn",
-                     disabled=(len(_jobs) == 0)):
+        _checked = []
+        for _i, (_label, _drv, _cid) in enumerate(_opts):
+            if st.checkbox(_label, key=f"surg_{_i}_{_drv}_{_cid}"):
+                _checked.append((_label, _drv, _cid))
+        if st.button(f"🪡 Apply {len(_checked)} change(s) surgically", key="surgical_btn",
+                     disabled=(len(_checked) == 0)):
             _surg_lookup = {}
             for _row in schedule_data[2:]:
                 _c = _row[6].strip() if len(_row) > 6 else ""
@@ -2905,7 +2761,7 @@ def main():
                         "dog_breed": _row[60].strip() if len(_row) > 60 else "",
                         "house_description": _row[61].strip() if len(_row) > 61 else "",
                     }
-            for _drv, _cid, _label, _pmode, _rmode in _jobs:
+            for _label, _drv, _cid in _checked:
                 _cfg = drivers.get(_drv)
                 if not _cfg or not _cfg["field_id"] or not _cfg["capacity"]:
                     st.error(f"{_label}: {_drv} has no usable Staff row — skipped.")
@@ -2914,8 +2770,7 @@ def main():
                     try:
                         _rep = surgical_apply(
                             client, SHEET_NAME, matrix, _drv, _cfg,
-                            assignments, _surg_lookup, selected_date,
-                            target_cid=_cid, pickup_mode=_pmode, removal_mode=_rmode,
+                            assignments, _surg_lookup, selected_date, target_cid=_cid,
                         )
                         # Sync the snapshot in BOTH outcomes: routes changed now, or routes
                         # already matched (handled earlier but never recorded). Either way this
