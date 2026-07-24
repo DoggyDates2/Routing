@@ -2376,29 +2376,26 @@ def main():
                             if cid and "cancel" in val.lower():
                                 cancelled_dogs.add(cid)
 
-                    # Build detail lines
-                    change_details = []
+                    # Build a table: Driver | Change | Assignment | Dog (first 10
+                    # chars; cancelled dogs just crossed out, no label)
+                    def _dog10(cid):
+                        nm = (dog_name_lookup.get(cid, cid) or cid).strip()[:10].strip()
+                        return nm.replace("|", "\\|") or cid
+
+                    table = ["| Driver | Change | Assignment | Dog |",
+                             "|---|---|---|---|"]
                     for driver_name in sorted(changed_active):
                         c = changes[driver_name]
-                        parts = []
-                        if c["added"]:
-                            added_items = []
-                            for cid, assignment in c["added"]:
-                                name = dog_name_lookup.get(cid, cid)[:25]
-                                added_items.append(f"{name} ({assignment})")
-                            parts.append(f"**added:** {', '.join(added_items)}")
-                        if c["removed"]:
-                            removed_items = []
-                            for cid, assignment in c["removed"]:
-                                name = dog_name_lookup.get(cid, cid)[:25]
-                                if cid in cancelled_dogs:
-                                    removed_items.append(f"~~{name}~~ CANCELLED")
-                                else:
-                                    removed_items.append(f"{name} ({assignment})")
-                            parts.append(f"**removed:** {', '.join(removed_items)}")
-                        change_details.append(f"• **{driver_name}** — {'; '.join(parts)}")
-                    
-                    st.info(f"🔄 {len(changed_active)} driver(s) have changes since last optimization:\n\n" + "\n".join(change_details))
+                        for cid, assignment in sorted(c["added"]):
+                            table.append(f"| **{driver_name}** | added | {assignment.replace('|', chr(92) + '|')} | {_dog10(cid)} |")
+                        for cid, assignment in sorted(c["removed"]):
+                            nm = _dog10(cid)
+                            if cid in cancelled_dogs:
+                                nm = f"~~{nm}~~"
+                            table.append(f"| **{driver_name}** | removed | {assignment.replace('|', chr(92) + '|')} | {nm} |")
+
+                    st.info(f"🔄 {len(changed_active)} driver(s) have changes since last optimization:")
+                    st.markdown("\n".join(table))
         else:
             st.success("No changes detected since last optimization")
     else:
