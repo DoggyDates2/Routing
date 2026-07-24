@@ -155,12 +155,20 @@ def parse_lat_lng(lat_raw, lng_raw):
 @st.cache_data(show_spinner=False, ttl=300)
 def load_birthdays(_client, sheet_name):
     """Read the Birthdays tab: col B = customer name, col H = birthday date,
-    col K = picture already taken (non-blank). Missing tab -> empty list."""
+    col K = picture already taken (non-blank). Looks in the Routing sheet first,
+    then the Schedule spreadsheet. Returns None if the tab exists nowhere."""
+    data = None
     try:
-        ws = _client.open(sheet_name).worksheet("Birthdays")
-        data = ws.get_all_values()
+        data = _client.open(sheet_name).worksheet("Birthdays").get_all_values()
     except Exception:
-        return []
+        try:
+            _sid = st.secrets.get("schedule_sheet_id", "")
+            if _sid:
+                data = _client.open_by_key(_sid).worksheet("Birthdays").get_all_values()
+        except Exception:
+            pass
+    if data is None:
+        return None
     out = []
     for row in data[1:]:
         name = row[1].strip() if len(row) > 1 else ""
@@ -189,7 +197,7 @@ def birthday_symbols(bdays, route_date):
     H after route date: K blank -> birthday cake (picture still needed); K filled -> nothing."""
     from datetime import datetime
     symbols = {}
-    if route_date is None:
+    if route_date is None or not bdays:
         return symbols
     for name, h_raw, k_filled in bdays:
         parsed = None
@@ -781,6 +789,18 @@ def _surgical_compute(rows, matrix, driver_name, config, assignments, schedule_l
     for a in my_assignments:
         sched_by_cid.setdefault(a["customer_id"], []).append(a)
 
+    if target_cid is not None and target_cid not in sched_by_cid:
+        _staff_hit = [a for a in assignments
+                      if a["driver"] == driver_name and a["is_staff_dog"]
+                      and a["customer_id"] == target_cid]
+        if _staff_hit:
+            raise ValueError(
+                f"{_staff_hit[0]['dog_name'] or target_cid} is classified as a STAFF dog "
+                f"(blank email in the Schedule) — staff dogs ride along but are never given "
+                f"route stops. If this is a customer dog, fill in the email in the Schedule, "
+                f"hit Refresh Data, then optimize this driver."
+            )
+
     # ── Group→trip mapping derived from the SHEET itself (the sheet is the structure
     # of record; Staff/Schedule math is not consulted for trip structure) ──
     first_seen, last_seen = {}, {}
@@ -793,10 +813,14 @@ def _surgical_compute(rows, matrix, driver_name, config, assignments, schedule_l
     from collections import Counter as _Counter
     _pv, _dv = {}, {}
     for c, t in first_seen.items():
+        if c == target_cid:
+            continue  # a dog being moved must not vote with its old position
         al = sched_by_cid.get(c)
         if al:
             _pv.setdefault(al[0]["pickup_group"], _Counter())[t] += 1
     for c, t in last_seen.items():
+        if c == target_cid:
+            continue
         al = sched_by_cid.get(c)
         if al:
             _dv.setdefault(al[0]["dropoff_group"], _Counter())[t] += 1
@@ -829,6 +853,17 @@ def _surgical_compute(rows, matrix, driver_name, config, assignments, schedule_l
     if target_cid is not None:
         new_cids = [c for c in new_cids if c == target_cid]
         removed_cids = [c for c in removed_cids if c == target_cid]
+        # Group change: dog is in the sheet AND on the schedule, but under a
+        # different assignment — remove old stops, re-insert under the new code.
+        if (not new_cids and not removed_cids
+                and target_cid in sched_by_cid and target_cid in sheet_cids):
+            _sched_raw = (sched_by_cid[target_cid][0]["raw"] or "").strip()
+            _sheet_raws = {(rows[i][0] or "").strip()
+                           for t in trip_rows.values() for i in t
+                           if (rows[i][10] or "").strip() == target_cid}
+            if _sched_raw and _sched_raw not in _sheet_raws:
+                removed_cids = [target_cid]
+                new_cids = [target_cid]
     if not new_cids and not removed_cids:
         return None, []
 
@@ -1753,6 +1788,12 @@ def main():
 
     scheduled_names = sorted(set(a["driver"] for a in assignments if a.get("driver")))
     st.sidebar.markdown(f"**Drivers on schedule:** {len(scheduled_names)}")
+    _bd = load_birthdays(client, SHEET_NAME)
+    if _bd is None:
+        st.sidebar.warning("🎂 Birthdays tab NOT FOUND (checked Routing + Schedule spreadsheets)")
+    else:
+        _bs = birthday_symbols(_bd, parse_route_date(selected_date))
+        st.sidebar.caption(f"🎂 Birthdays: {len(_bd)} entries loaded, {len(_bs)} flagged for {selected_date}")
     st.sidebar.markdown(f"**Dog assignments:** {len(assignments)}")
 
     # ── Build driver info (Schedule tab is the source of truth) ──
@@ -1856,11 +1897,6 @@ def main():
             import requests as _rq
             _ors_key = st.secrets.get("ors_api_key", "")
             _geocoded, _failed = {}, []
-            _sched_ws = None
-            try:
-                _sched_ws = client.open_by_key(schedule_sheet_id).worksheet("Schedule")
-            except Exception:
-                pass
             for _cid, _nm, _addr, _ridx in missing_no_coords:
                 _res = None
                 if _addr and _ors_key:
@@ -1879,18 +1915,12 @@ def main():
                         _res = None
                 if _res:
                     _geocoded[_cid] = {"lat": _res[0], "lng": _res[1]}
-                    if _sched_ws is not None and _ridx >= 0:
-                        try:
-                            _sched_ws.update_cell(_ridx + 1, 9, _res[0])
-                            _sched_ws.update_cell(_ridx + 1, 10, _res[1])
-                        except Exception:
-                            pass
                 else:
                     _failed.append(f"{_nm} ({_addr or 'no address'})")
             if _geocoded:
                 matrix = auto_add_to_matrix(client, matrix, _geocoded, schedule_data)
                 all_matrix_ids = set(matrix.keys())
-                st.success(f"📍 Geocoded, saved to Schedule, and added {len(_geocoded)} dog(s) to the matrix. Re-optimize the affected drivers.")
+                st.success(f"📍 Geocoded and added {len(_geocoded)} dog(s) to the matrix. Re-optimize the affected drivers. (Tip: paste the coordinates into Schedule I/J yourself so they persist.)")
             if _failed:
                 st.error("Couldn't geocode (check the address in column A): " + ", ".join(_failed))
 
