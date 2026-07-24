@@ -221,6 +221,11 @@ def birthday_symbols(bdays, route_date):
     return symbols
 
 
+def is_front_dog(name):
+    """FRNT anywhere in the dog's name = rides in the (single) front seat."""
+    return "FRNT" in (name or "").upper()
+
+
 def strip_birthday_symbols(name):
     return name.replace("🎂", "").replace("🎁", "").strip()
 
@@ -295,6 +300,11 @@ def parse_schedule(schedule_data, date_col_idx):
         driver_name = parts[0].strip()
         code = parts[1].strip() if len(parts) > 1 else ""
 
+        # "XX" in the code (e.g. 1XX23, upper or lower case) = ride-along dog:
+        # rides in the van all day, takes capacity, shows on the checklist,
+        # but gets NO pickup/dropoff stops in the route.
+        is_ride_along = "xx" in code.lower()
+
         # Handle "!" split — dog goes home between groups (e.g., "1!3" = group 1, then group 3 separately)
         if "!" in code:
             sub_codes = code.split("!")
@@ -309,6 +319,7 @@ def parse_schedule(schedule_data, date_col_idx):
                     "dropoff_group": int(digits[-1]),
                     "dog_count": dog_count,
                     "is_staff_dog": (email == ""),
+                    "is_ride_along": is_ride_along,
                     "dog_name": dog_name,
                     "address": address,
                     "raw": assignment_str,
@@ -324,6 +335,7 @@ def parse_schedule(schedule_data, date_col_idx):
                 "dropoff_group": int(digits[-1]),
                 "dog_count": dog_count,
                 "is_staff_dog": (email == ""),
+                "is_ride_along": is_ride_along,
                 "dog_name": dog_name,
                 "address": address,
                 "raw": assignment_str,
@@ -381,8 +393,19 @@ def solve_driver(matrix, driver_name, config, dogs, schedule_lookup):
     field_address = config.get("field_address", "")
     parking_address = config.get("parking_address", "")
 
-    customer_dogs = [d for d in dogs if not d["is_staff_dog"]]
-    staff_dogs = [d for d in dogs if d["is_staff_dog"]]
+    # Ride-along (XX) dogs get the same treatment as staff dogs here:
+    # they occupy capacity across their group span but are never given stops.
+    customer_dogs = [d for d in dogs if not d["is_staff_dog"] and not d.get("is_ride_along")]
+    staff_dogs = [d for d in dogs if d["is_staff_dog"] or d.get("is_ride_along")]
+
+    no_parking_sub = bool(field) and not parking
+    if no_parking_sub:
+        parking = field  # no parking ID — start and end the day at the field
+
+    # FRNT front-seat dogs — one front seat per van, so at most one FRNT dog
+    # on board at any moment. Riding (staff/XX) FRNT dogs occupy it for their span.
+    front_riding = [d for d in staff_dogs if is_front_dog(d.get("dog_name"))]
+
     dog_lookup = {d["customer_id"]: d for d in customer_dogs}
 
     # Build a set of all customer_ids that have a ! assignment (split groups)
@@ -443,6 +466,82 @@ def solve_driver(matrix, driver_name, config, dogs, schedule_lookup):
 
     results = []
 
+    def _note_row(tag, msg):
+        results.append({
+            "Driver": driver_name, "Leg": 0, "Stop": 0,
+            "Action": tag, "Customer ID": "",
+            "Dog Name": msg,
+            "Address": "", "Phone": "", "Customer Name": "",
+            "Instructions": "", "Dog Breed": "", "House Description": "",
+            "Dogs at Stop": "", "Dogs on Board": "",
+            "Assignment": driver_name, "Drive Min": "",
+        })
+
+    def _front_warn(msg):
+        _note_row("⚠️ FRONT SEAT",
+                  f"{msg} Route still built — fix the schedule or check by hand.")
+
+    if no_parking_sub:
+        _note_row("⚠️ NO PARKING ID",
+                  "No parking ID in the Staff tab — route starts and ends at the field.")
+
+    if not field:
+        # ── NO STAFF ANCHORS: never skip anyone. Route house-to-house per group,
+        #    nearest-neighbor order, no parking start / field stops / capacity. ──
+        _note_row("⚠️ NO STAFF ROW",
+                  "No usable Staff row — routed house-to-house with no parking or "
+                  "field stops and no capacity limit. Fill in the Staff tab for real routing.")
+        _fr = [d.get("dog_name") or d["customer_id"] for d in customer_dogs + staff_dogs
+               if is_front_dog(d.get("dog_name"))]
+        if len(_fr) > 1:
+            _front_warn(f"{', '.join(_fr)} are all on this driver, which has no field "
+                        f"structure to sequence the front seat around.")
+
+        def _nn_order(ds):
+            remaining = list(ds)
+            if not remaining:
+                return []
+            ordered = [remaining.pop(0)]
+            while remaining:
+                last = ordered[-1]["customer_id"]
+                nxt = min(remaining,
+                          key=lambda d: float(matrix.get(last, {}).get(d["customer_id"], 9999)))
+                remaining.remove(nxt)
+                ordered.append(nxt)
+            return ordered
+
+        load = 0
+        leg = 0
+        last_g = groups[-1] if groups else 0
+        for g in groups:
+            picks = [d for d in customer_dogs if d["pickup_group"] == g]
+            drops = [d for d in customer_dogs
+                     if d["dropoff_group"] == g or (g == last_g and d["dropoff_group"] > g)]
+            for action, ds in (("PICK UP", picks), ("DROP OFF", drops)):
+                ds = _nn_order(ds)
+                if not ds:
+                    continue
+                leg += 1
+                for i, d in enumerate(ds):
+                    load += d["dog_count"] if action == "PICK UP" else -d["dog_count"]
+                    extra = get_extra_info(d["customer_id"])
+                    results.append({
+                        "Driver": driver_name, "Leg": leg, "Stop": i + 1,
+                        "Action": action, "Customer ID": d["customer_id"],
+                        "Dog Name": get_dog_display_name(d["customer_id"], action),
+                        "Address": d.get("address", ""),
+                        "Phone": extra.get("Phone", ""),
+                        "Customer Name": extra.get("Customer Name", ""),
+                        "Instructions": extra.get("Instructions", ""),
+                        "Dog Breed": extra.get("Dog Breed", ""),
+                        "House Description": extra.get("House Description", ""),
+                        "Dogs at Stop": d.get("dog_count", ""),
+                        "Dogs on Board": max(load, 0),
+                        "Assignment": d.get("raw", "") or driver_name,
+                        "Drive Min": "",
+                    })
+        return results
+
     for leg_num in range(len(groups) + 1):
 
         if leg_num == 0:
@@ -453,6 +552,14 @@ def solve_driver(matrix, driver_name, config, dogs, schedule_lookup):
             ]
             if not pickup_dogs:
                 continue
+
+            _front_names = [d.get("dog_name") or d["customer_id"] for d in pickup_dogs
+                            if is_front_dog(d.get("dog_name"))]
+            _front_names += [d.get("dog_name") or d["customer_id"] for d in front_riding
+                             if d["pickup_group"] <= current_group <= d["dropoff_group"]]
+            if len(_front_names) > 1:
+                _front_warn(f"{', '.join(_front_names)} are all in group {current_group} pickups — "
+                            f"they'd share the front seat with no drop-off in between.")
 
             stop_ids = [d["customer_id"] for d in pickup_dogs]
             total_dogs = sum(d["dog_count"] for d in pickup_dogs)
@@ -522,7 +629,7 @@ def solve_driver(matrix, driver_name, config, dogs, schedule_lookup):
             )
             staying_staff = sum(
                 d["dog_count"] for d in staff_dogs
-                if d["pickup_group"] <= prev_group and d["dropoff_group"] > prev_group
+                if d["pickup_group"] <= next_group and d["dropoff_group"] >= prev_group
             )
 
             dogs_being_dropped = sum(cnt for _, cnt in dropoffs)
@@ -532,15 +639,55 @@ def solve_driver(matrix, driver_name, config, dogs, schedule_lookup):
             if not dropoffs and not pickups:
                 continue
 
+            # ── Front-seat (FRNT) info for this leg ──
+            _name_of = {d["customer_id"]: d.get("dog_name", "") for d in customer_dogs}
+            front_drop_ids = {c for c, _ in dropoffs if is_front_dog(_name_of.get(c))}
+            front_pick_ids = {c for c, _ in pickups if is_front_dog(_name_of.get(c))}
+            front_staying = sum(
+                1 for d in customer_dogs
+                if d["pickup_group"] < next_group
+                and d["dropoff_group"] > prev_group
+                and d["pickup_group"] <= prev_group
+                and is_front_dog(d.get("dog_name"))
+            )
+            front_ride_cnt = sum(
+                1 for d in front_riding
+                if d["pickup_group"] <= next_group and d["dropoff_group"] >= prev_group
+            )
+            front_initial = len(front_drop_ids) + front_staying + front_ride_cnt
+            front_end = len(front_pick_ids) + front_staying + front_ride_cnt
+            _front_kw = {}
+            if front_initial > 1 or front_end > 1:
+                _fn = sorted({_name_of.get(c, c) for c in (front_drop_ids | front_pick_ids)})
+                _front_warn(f"more than one FRNT dog must be on board at once during "
+                            f"groups {prev_group}→{next_group} ({', '.join(_fn) or 'incl. riding dogs'}).")
+            elif front_initial or front_pick_ids:
+                _front_kw = dict(front_drop_ids=front_drop_ids,
+                                 front_pick_ids=front_pick_ids,
+                                 front_initial=front_initial)
+
             result = solve_interleaved_trip(
-                matrix, dropoffs, pickups, field, field, capacity, initial_load
+                matrix, dropoffs, pickups, field, field, capacity, initial_load, **_front_kw
             )
 
             # If capacity is too tight, retry with relaxed limit
             if result is None:
                 result = solve_interleaved_trip(
-                    matrix, dropoffs, pickups, field, field, capacity + 4, initial_load
+                    matrix, dropoffs, pickups, field, field, capacity + 4, initial_load, **_front_kw
                 )
+
+            # Never let the front-seat rule kill a route: drop it, warn, retry
+            if result is None and _front_kw:
+                result = solve_interleaved_trip(
+                    matrix, dropoffs, pickups, field, field, capacity, initial_load
+                )
+                if result is None:
+                    result = solve_interleaved_trip(
+                        matrix, dropoffs, pickups, field, field, capacity + 4, initial_load
+                    )
+                if result is not None:
+                    _front_warn(f"couldn't order stops to keep only one FRNT dog up front "
+                                f"during groups {prev_group}→{next_group} — check this route by hand.")
 
             if result:
                 route, dist = result
@@ -626,7 +773,7 @@ def solve_driver(matrix, driver_name, config, dogs, schedule_lookup):
 # WRITE TO SHEET
 # =============================================================================
 
-def write_results_to_sheet(client, sheet_name, new_results, optimized_drivers, selected_date):
+def write_results_to_sheet(client, sheet_name, new_results, optimized_drivers, selected_date, ride_alongs=None):
     """Write routes to sheet with date tracking."""
     sheet = client.open(sheet_name)
     
@@ -713,7 +860,7 @@ def write_results_to_sheet(client, sheet_name, new_results, optimized_drivers, s
 
     # Build checklist for columns M, N, O — from the MERGED rows, so drivers that
     # weren't re-optimized keep their checklist entries (bug fix)
-    checklist_rows = build_driver_checklist(rows_to_checklist_results(all_rows))
+    checklist_rows = build_driver_checklist(rows_to_checklist_results(all_rows), ride_alongs)
     
     max_rows = max(len(all_rows), len(checklist_rows)) + 2  # +2 for date row and header
     ws = sheet.add_worksheet(title=OUTPUT_TAB_NAME, rows=max_rows, cols=15)
@@ -782,9 +929,13 @@ def _surgical_compute(rows, matrix, driver_name, config, assignments, schedule_l
             f"No existing route rows found for {driver_name} — run a full optimization for this driver first."
         )
 
-    my_assignments = [a for a in assignments if a["driver"] == driver_name and not a["is_staff_dog"]]
-    staff_load = sum(a["dog_count"] for a in assignments
-                     if a["driver"] == driver_name and a["is_staff_dog"])
+    my_assignments = [a for a in assignments if a["driver"] == driver_name
+                      and not a["is_staff_dog"] and not a.get("is_ride_along")]
+    # FRNT: staff/XX riding dogs with FRNT names hold the front seat for their span
+    front_riding_a = [a for a in assignments
+                      if a["driver"] == driver_name
+                      and (a["is_staff_dog"] or a.get("is_ride_along"))
+                      and is_front_dog(a.get("dog_name"))]
     sched_by_cid = {}
     for a in my_assignments:
         sched_by_cid.setdefault(a["customer_id"], []).append(a)
@@ -799,6 +950,17 @@ def _surgical_compute(rows, matrix, driver_name, config, assignments, schedule_l
                 f"(blank email in the Schedule) — staff dogs ride along but are never given "
                 f"route stops. If this is a customer dog, fill in the email in the Schedule, "
                 f"hit Refresh Data, then optimize this driver."
+            )
+        _ra_hit = [a for a in assignments
+                   if a["driver"] == driver_name and a.get("is_ride_along")
+                   and a["customer_id"] == target_cid]
+        _in_sheet = any((r[10] or "").strip() == target_cid for r in rows)
+        if _ra_hit and not _in_sheet:
+            raise ValueError(
+                f"{_ra_hit[0]['dog_name'] or target_cid} has an XX code "
+                f"({_ra_hit[0]['raw']}) — ride-along dogs get no route stops. "
+                f"They're counted for capacity and will appear on the checklist "
+                f"the next time this date's routes are written."
             )
 
     # ── Group→trip mapping derived from the SHEET itself (the sheet is the structure
@@ -923,8 +1085,19 @@ def _surgical_compute(rows, matrix, driver_name, config, assignments, schedule_l
             return -a["dog_count"]
         return 0
 
+    def staff_load_at(trip):
+        load = 0
+        for a in assignments:
+            if a["driver"] != driver_name or not (a["is_staff_dog"] or a.get("is_ride_along")):
+                continue
+            tp = trip_of_pickup.get(a["pickup_group"])
+            td = trip_of_dropoff.get(a["dropoff_group"])
+            if tp is None or td is None or tp <= trip <= td:
+                load += a["dog_count"]  # unknown span counts everywhere (safe side)
+        return load
+
     def entering_load(trip):
-        load = staff_load
+        load = staff_load_at(trip)
         for a in my_assignments:
             tp = trip_of_pickup.get(a["pickup_group"])
             td = trip_of_dropoff.get(a["dropoff_group"])
@@ -939,6 +1112,34 @@ def _surgical_compute(rows, matrix, driver_name, config, assignments, schedule_l
             cur += row_delta(rows[i], trip)
             loads.append(cur)
         return start, loads
+
+    def _front_delta(row, trip):
+        # +1 / -1 when a FRNT dog is picked up / dropped at this row (name in col C)
+        if not is_front_dog(row[2]):
+            return 0
+        d = row_delta(row, trip)
+        return 1 if d > 0 else (-1 if d < 0 else 0)
+
+    def entering_front(trip):
+        f = sum(1 for a in front_riding_a
+                if trip_of_pickup.get(a["pickup_group"]) is not None
+                and trip_of_dropoff.get(a["dropoff_group"]) is not None
+                and trip_of_pickup[a["pickup_group"]] <= trip <= trip_of_dropoff[a["dropoff_group"]])
+        for a in my_assignments:
+            tp = trip_of_pickup.get(a["pickup_group"])
+            td = trip_of_dropoff.get(a["dropoff_group"])
+            if (tp is not None and td is not None and tp < trip <= td
+                    and is_front_dog(a.get("dog_name"))):
+                f += 1
+        return f
+
+    def front_loads(trip):
+        start = entering_front(trip)
+        floads, cur = [], start
+        for i in trip_rows.get(trip, []):
+            cur += _front_delta(rows[i], trip)
+            floads.append(cur)
+        return start, floads
 
     inserts = {}  # orig_index -> list of new rows placed AFTER that index
 
@@ -962,7 +1163,24 @@ def _surgical_compute(rows, matrix, driver_name, config, assignments, schedule_l
         start, loads = trip_loads(trip)
         seq_ids = [(rows[i][10] or "").strip() for i in idxs]
         new_id = new_row[10]
-        best, best_any = None, None
+
+        # FRNT front-seat check: only one front seat. For a FRNT pickup, the
+        # slot is valid only if no FRNT dog is (or will be) on board from that
+        # point on; for a FRNT dropoff, it must come before any FRNT pickup.
+        new_is_front = is_front_dog(new_row[2])
+        fstart, floads = front_loads(trip) if new_is_front else (0, [])
+
+        def _front_ok(k):
+            if not new_is_front:
+                return True
+            if is_pickup:
+                tail = floads[k:] if k < len(floads) else [floads[-1] if floads else fstart]
+                return max(tail) + 1 <= 1
+            pre = [fstart] + floads[: k + 1]
+            post = [f - 1 for f in floads[k:]] if k < len(floads) else []
+            return max(pre + post) <= 1 if (pre + post) else True
+
+        best, best_any, best_front = None, None, None
         for k in range(len(idxs) - 1):
             a_id, b_id = seq_ids[k], seq_ids[k + 1]
             if not a_id or not b_id:
@@ -976,17 +1194,30 @@ def _surgical_compute(rows, matrix, driver_name, config, assignments, schedule_l
                 fits = max(loads[k:]) + cnt <= capacity
             else:
                 fits = max([start] + loads[: k + 1]) <= capacity
-            if fits and (best is None or cost < best[1]):
+            f_ok = _front_ok(k)
+            if fits and f_ok and (best is None or cost < best[1]):
                 best = (k, cost)
+            if f_ok and (best_front is None or cost < best_front[1]):
+                best_front = (k, cost)
         over = False
+        front_conflict = False
+        if best is None and best_front is not None:
+            best = best_front  # keeps the front seat rule, allows over-capacity
+            over = True
         if best is None:
             if best_any is None:
                 raise ValueError(
                     f"No usable position for {label} in {driver_name}{trip} — missing "
                     f"distances in the matrix. Run a full re-optimization."
                 )
-            best = best_any  # capacity is best-effort, never a refusal
+            best = best_any  # capacity/front are best-effort, never a refusal
             over = True
+            front_conflict = new_is_front
+        if front_conflict:
+            report.append(
+                f"\u26a0\ufe0f FRONT SEAT: couldn't place {label} in {driver_name}{trip} "
+                f"without two FRNT dogs on board at once — check this trip by hand."
+            )
         k, cost = best
         inserts.setdefault(idxs[k], []).append(new_row)
         touched_trips.add(trip)
@@ -1030,10 +1261,38 @@ def _surgical_compute(rows, matrix, driver_name, config, assignments, schedule_l
             else:
                 drops.append((c, cnt_of(c)))
         drops.append((new_a["customer_id"], new_a["dog_count"]))
-        load = staff_load + new_a["dog_count"]
+        load = staff_load_at(td) + new_a["dog_count"]
         for c, span in cid_trips.items():
             if min(span) < td <= max(span):
                 load += cnt_of(c)
+
+        # ── FRNT front-seat info for this trip's re-solve ──
+        def _front_c(c):
+            al = sched_by_cid.get(c)
+            if al and is_front_dog(al[0].get("dog_name")):
+                return True
+            return is_front_dog((row_by_cid.get(c, ["", "", ""])[2] or ""))
+        front_drop_ids = {c for c, _ in drops if _front_c(c)}
+        front_pick_ids = {c for c, _ in picks if _front_c(c)}
+        front_through = sum(1 for c, span in cid_trips.items()
+                            if c not in row_by_cid and min(span) < td <= max(span)
+                            and _front_c(c))
+        front_ride_cnt = sum(1 for a in front_riding_a
+                             if trip_of_pickup.get(a["pickup_group"]) is not None
+                             and trip_of_dropoff.get(a["dropoff_group"]) is not None
+                             and trip_of_pickup[a["pickup_group"]] <= td <= trip_of_dropoff[a["dropoff_group"]])
+        front_initial = len(front_drop_ids) + front_through + front_ride_cnt
+        front_end = len(front_pick_ids) + front_through + front_ride_cnt
+        _front_kw = {}
+        if front_initial > 1 or front_end > 1:
+            report.append(
+                f"\u26a0\ufe0f FRONT SEAT: more than one FRNT dog must be on board at once "
+                f"in {driver_name}{td} — fix the schedule; the route was still built."
+            )
+        elif front_initial or front_pick_ids:
+            _front_kw = dict(front_drop_ids=front_drop_ids,
+                             front_pick_ids=front_pick_ids,
+                             front_initial=front_initial)
         is_final = (td == max(trip_rows))
         def row_for(c):
             if c == new_a["customer_id"]:
@@ -1050,9 +1309,20 @@ def _surgical_compute(rows, matrix, driver_name, config, assignments, schedule_l
             res = None
             for _cap in (max(capacity, load), max(capacity + 4, load), load + 99):
                 res = solve_interleaved_trip(matrix, drops, picks, config["field_id"],
-                                             config["field_id"], _cap, load)
+                                             config["field_id"], _cap, load, **_front_kw)
                 if res is not None:
                     break
+            if res is None and _front_kw:
+                # Never let the front-seat rule kill a route: drop it, note it
+                for _cap in (max(capacity, load), max(capacity + 4, load), load + 99):
+                    res = solve_interleaved_trip(matrix, drops, picks, config["field_id"],
+                                                 config["field_id"], _cap, load)
+                    if res is not None:
+                        report.append(
+                            f"\u26a0\ufe0f FRONT SEAT: couldn't order {driver_name}{td} to keep "
+                            f"only one FRNT dog up front — check this trip by hand."
+                        )
+                        break
             if res is None:
                 raise ValueError(
                     f"Couldn't re-solve {driver_name}{td} — run a full re-optimization."
@@ -1122,6 +1392,12 @@ def surgical_apply(client, sheet_name, matrix, driver_name, config, assignments,
                    schedule_lookup, selected_date, target_cid=None):
     """Sheet wrapper around _surgical_compute. All validation happens BEFORE the tab
     is rewritten, so refusals never destroy existing routes."""
+    if not config.get("field_id"):
+        raise ValueError(
+            f"{driver_name} has no field ID in the Staff tab — their route has no "
+            f"anchors, so surgical changes can't work. Fill in their Staff row, "
+            f"then run a full optimization for them."
+        )
     sheet = client.open(sheet_name)
     try:
         ws = sheet.worksheet(OUTPUT_TAB_NAME)
@@ -1147,7 +1423,10 @@ def surgical_apply(client, sheet_name, matrix, driver_name, config, assignments,
     header = ["Assignment", "Min to Next", "Dog Name", "Address", "Phone",
               "Customer Name", "Instructions", "Dog Breed", "House Description",
               "Driver Trip", "Customer ID"]
-    checklist_rows = build_driver_checklist(rows_to_checklist_results(final_rows))
+    checklist_rows = build_driver_checklist(
+        rows_to_checklist_results(final_rows),
+        [a for a in assignments if a.get("is_ride_along") and not a["is_staff_dog"]],
+    )
     max_rows = max(len(final_rows), len(checklist_rows)) + 2
     sheet.del_worksheet(ws)
     ws = sheet.add_worksheet(title=OUTPUT_TAB_NAME, rows=max_rows, cols=15)
@@ -1162,8 +1441,10 @@ def surgical_apply(client, sheet_name, matrix, driver_name, config, assignments,
     return report
 
 
-def build_driver_checklist(results):
-    """Build a flat checklist of all dogs organized by driver and group."""
+def build_driver_checklist(results, ride_alongs=None):
+    """Build a flat checklist of all dogs organized by driver and group.
+    ride_alongs: XX-code dogs from the schedule — never routed, but they ride in
+    the van all day, so they're injected here for every group in their span."""
     # Collect all dogs by driver and the groups they participate in
     # Use the results to figure out which drivers and dogs exist
     dog_groups = {}  # (driver, customer_id, dog_name) → set of groups
@@ -1233,6 +1514,17 @@ def build_driver_checklist(results):
                         for g in range(int(digits[0]), int(digits[-1]) + 1):
                             dog_groups[key].add(g)
 
+    # Inject ride-along (XX) dogs — they have no route rows to derive from
+    if ride_alongs:
+        _present = {(drv, c) for (drv, c, _n) in dog_groups}
+        for a in ride_alongs:
+            drv, c = a["driver"], a["customer_id"]
+            if not drv or not c or (drv, c) in _present:
+                continue  # skip if already listed via leftover route rows
+            nm = (a.get("dog_name") or c).strip()
+            grps = set(range(a["pickup_group"], a["dropoff_group"] + 1))
+            dog_groups.setdefault((drv, c, nm), set()).update(grps)
+
     # Build checklist rows
     group_emoji = {1: "✅ ", 2: "💛 ", 3: "🔴 "}
     checklist = []
@@ -1268,7 +1560,7 @@ def save_snapshot(client, sheet_name, assignments, snapshot_date=""):
 
     rows = [["Driver", "Customer ID", "Assignment", "Dog Count", snapshot_date]]
     for a in assignments:
-        if a.get("is_staff_dog"):
+        if a.get("is_staff_dog") or a.get("is_ride_along"):
             continue
         rows.append([a["driver"], a["customer_id"], a["raw"], a["dog_count"], ""])
 
@@ -1293,7 +1585,8 @@ def update_snapshot_for_driver(client, sheet_name, assignments, driver_name):
         if row and row[0].strip() and row[0].strip() != driver_name:
             rows.append(list(row)[:4] + [""] * max(0, 4 - len(row)))
     for a in assignments:
-        if a["driver"] == driver_name and not a.get("is_staff_dog"):
+        if (a["driver"] == driver_name and not a.get("is_staff_dog")
+                and not a.get("is_ride_along")):
             rows.append([a["driver"], a["customer_id"], a["raw"], a["dog_count"], ""])
     sheet.del_worksheet(ws)
     ws = sheet.add_worksheet(title=SNAPSHOT_TAB_NAME, rows=len(rows), cols=5)
@@ -1319,7 +1612,8 @@ def update_snapshot_for_dog(client, sheet_name, assignments, driver_name, cid):
             continue  # drop the old snapshot line for this dog
         rows.append(list(row)[:4] + [""] * max(0, 4 - len(row)))
     for a in assignments:
-        if a["driver"] == driver_name and a["customer_id"] == cid and not a.get("is_staff_dog"):
+        if (a["driver"] == driver_name and a["customer_id"] == cid
+                and not a.get("is_staff_dog") and not a.get("is_ride_along")):
             rows.append([a["driver"], a["customer_id"], a["raw"], a["dog_count"], ""])
     sheet.del_worksheet(ws)
     ws = sheet.add_worksheet(title=SNAPSHOT_TAB_NAME, rows=len(rows), cols=5)
@@ -1357,8 +1651,8 @@ def detect_changes(assignments, snapshot):
 
     current = {}
     for a in assignments:
-        if a.get("is_staff_dog"):
-            continue  # staff dogs are never routed — not a routable change
+        if a.get("is_staff_dog") or a.get("is_ride_along"):
+            continue  # staff / XX ride-along dogs are never routed — not a routable change
         driver = a["driver"]
         if driver not in current:
             current[driver] = set()
@@ -1805,9 +2099,18 @@ def main():
     missing_staff_info = []
     for name in scheduled_names:
         config = drivers.get(name)
-        if not config or not config["field_id"] or not config["capacity"]:
+        no_staff = not config or not config.get("field_id") or not config.get("capacity")
+        if no_staff:
             missing_staff_info.append(name)
-            continue
+            base = config or {}
+            config = {
+                "field_id": base.get("field_id") or "",
+                "parking_id": base.get("parking_id") or "",
+                "capacity": base.get("capacity") or 12,
+                "field_address": base.get("field_address", ""),
+                "parking_address": base.get("parking_address", ""),
+            }
+            drivers[name] = config  # so the optimize jobs can find it
         # Derive groups from actual assignments, not Staff tab
         config["groups"] = derive_groups(assignments, name)
         dogs = [a for a in assignments if a["driver"] == name]
@@ -1820,13 +2123,15 @@ def main():
                 "capacity": config["capacity"],
                 "dogs": dog_count,
                 "staff_dogs": staff_count,
+                "no_staff": no_staff,
             })
 
     if missing_staff_info:
-        st.error(
-            "🚨 NOT BEING ROUTED: " + ", ".join(missing_staff_info) + " — on the Schedule "
-            "with dogs assigned, but missing field/parking/capacity in the Staff tab. "
-            "Their dogs will NOT appear in any route until their Staff row is filled in."
+        st.warning(
+            "⚠️ NO STAFF ROW: " + ", ".join(missing_staff_info) + " — on the Schedule "
+            "with dogs assigned but missing field/capacity in the Staff tab. Their dogs WILL "
+            "still be routed, house-to-house with no parking start or field stops, and flagged "
+            "on the Routes tab. Fill in their Staff row for real routing."
         )
 
     # ── Auto-check for missing dogs and add them ──
@@ -1856,7 +2161,8 @@ def main():
     missing_dogs = {}
     missing_no_coords = []
     for a in assignments:
-        if a["customer_id"] not in all_matrix_ids and not a["is_staff_dog"]:
+        if (a["customer_id"] not in all_matrix_ids and not a["is_staff_dog"]
+                and not a.get("is_ride_along")):
             # Get lat/lng from schedule
             for _sched_idx, row in enumerate(schedule_data):
                 if _sched_idx < 2:
@@ -2110,7 +2416,8 @@ def main():
 
             # Simple label — just name + change indicator
             change_tag = " 🔄" if has_changes else ""
-            label = f"{name}{change_tag}"
+            staff_tag = " ⚠️" if d.get("no_staff") else ""
+            label = f"{name}{change_tag}{staff_tag}"
 
             with cols[col_idx]:
                 if st.checkbox(label, key=f"driver_{name}"):
@@ -2208,7 +2515,10 @@ def main():
         # Auto-write to Google Sheet and save snapshot
         with st.spinner("Writing routes to Google Sheet..."):
             try:
-                count = write_results_to_sheet(client, SHEET_NAME, all_results, selected_drivers, selected_date)
+                count = write_results_to_sheet(
+                    client, SHEET_NAME, all_results, selected_drivers, selected_date,
+                    ride_alongs=[a for a in assignments if a.get("is_ride_along") and not a["is_staff_dog"]],
+                )
                 save_snapshot(client, SHEET_NAME, assignments, snapshot_date=selected_date)
                 st.session_state["write_success"] = f"✅ Wrote {count} total rows to '{OUTPUT_TAB_NAME}' (updated {len(selected_drivers)} drivers, kept others)."
             except Exception as e:
@@ -2232,12 +2542,10 @@ def main():
         # Validation
         validation_issues = []
         for driver_name in optimized_drivers:
-            if driver_name not in drivers:
-                continue
-
             expected_dogs = [
                 a for a in assignments
                 if a["driver"] == driver_name and not a["is_staff_dog"]
+                and not a.get("is_ride_along")
             ]
             expected_ids = set(a["customer_id"] for a in expected_dogs)
 
@@ -2251,7 +2559,6 @@ def main():
             if missing_from_route:
                 for mid in missing_from_route:
                     dog_info = next((a for a in expected_dogs if a["customer_id"] == mid), {})
-                    config = drivers[driver_name]
                     if mid not in matrix:
                         reason = "not in matrix"
                     else:
