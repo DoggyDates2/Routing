@@ -2002,7 +2002,7 @@ def auto_add_to_matrix(client, matrix, missing_dogs, schedule_data):
 def main():
     st.set_page_config(page_title="Doggy Dates Route Optimizer", page_icon="🐕", layout="wide")
 
-    st.title("🐕 Doggy Dates Route Optimizer")
+    st.markdown("<h1 style='color: green;'>Doggy Dates Route Optimizer</h1>", unsafe_allow_html=True)
 
     # Refresh button to reload data from Sheets
     if st.button("🔄 Refresh Data", help="Reload latest data from Google Sheets"):
