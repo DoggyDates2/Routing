@@ -1778,10 +1778,10 @@ def main():
             })
 
     if missing_staff_info:
-        st.warning(
-            "These drivers are on the Schedule for this date but have no usable Staff row "
-            "(missing field, parking, or capacity) and were skipped: "
-            + ", ".join(missing_staff_info)
+        st.error(
+            "🚨 NOT BEING ROUTED: " + ", ".join(missing_staff_info) + " — on the Schedule "
+            "with dogs assigned, but missing field/parking/capacity in the Staff tab. "
+            "Their dogs will NOT appear in any route until their Staff row is filled in."
         )
 
     # ── Auto-check for missing dogs and add them ──
