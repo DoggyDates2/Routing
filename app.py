@@ -2030,7 +2030,8 @@ def main():
     if st.button("🔄 Refresh Data", help="Reload latest data from Google Sheets"):
         st.cache_data.clear()
         for key in list(st.session_state.keys()):
-            if key.startswith("driver_") or key.startswith("defaults_applied"):
+            if (key.startswith("driver_") or key.startswith("defaults_applied")
+                    or key.startswith("changed_seen")):
                 del st.session_state[key]
         st.rerun()
 
@@ -2437,6 +2438,18 @@ def main():
         mostly_changed = pct_changed >= 0.70
     else:
         mostly_changed = False
+
+    # Auto-check drivers whose changes showed up AFTER this session's defaults
+    # were applied (e.g. a cancellation came in while the app was already open).
+    # Only newly-changed drivers are touched, so manual selections are preserved.
+    _seen_key = f"changed_seen_{selected_date}"
+    _active_names = set(d["name"] for d in active_drivers_with_dogs)
+    _seen = set(st.session_state.get(_seen_key, []))
+    _newly_changed = (changed_drivers & _active_names) - _seen
+    if st.session_state.get(f"defaults_applied_{selected_date}", False) and _newly_changed:
+        for _n in _newly_changed:
+            st.session_state[f"driver_{_n}"] = True
+    st.session_state[_seen_key] = list(_seen | (changed_drivers & _active_names))
 
     selected_drivers = []
     
