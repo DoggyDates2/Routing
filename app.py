@@ -811,10 +811,15 @@ def write_results_to_sheet(client, sheet_name, new_results, optimized_drivers, s
         existing_data = existing_ws.get_all_values()
         
         # Check if existing data is from the same date
-        existing_date = existing_data[0][0] if existing_data and existing_data[0] else ""
-        same_date = (existing_date == selected_date)
-        
-        if same_date and len(existing_data) > 1 and existing_data[1] == header:
+        existing_date = (existing_data[0][0] if existing_data and existing_data[0] else "").strip()
+        same_date = (existing_date == selected_date.strip())
+
+        # NOTE: get_all_values pads every row to the sheet's full width (15 cols,
+        # because the checklist lives in M/N/O), so compare ONLY the first 11 cells —
+        # comparing the whole padded row silently disabled merging and caused partial
+        # optimizes to wipe the other drivers' routes.
+        _row2 = [c.strip() for c in existing_data[1][:len(header)]] if len(existing_data) > 1 else []
+        if same_date and _row2 == header:
             # Same date — check for manual name edits and merge
             for row in existing_data[2:]:  # skip date row and header
                 if len(row) > 10 and row[10]:
@@ -823,21 +828,17 @@ def write_results_to_sheet(client, sheet_name, new_results, optimized_drivers, s
                     if cid and existing_name:
                         custom_names[cid] = existing_name
 
-                # Merge: keep rows for drivers NOT being re-optimized (partial runs only)
-                total_drivers_in_sheet = len(set(
-                    r[0].split(":")[0] for r in existing_data[2:]
-                    if r and len(r) > 0 and ":" in r[0]
-                ))
-                if len(optimized_drivers) < total_drivers_in_sheet / 2:
-                    if len(row) > 0 and ":" in row[0]:
-                        row_driver = row[0].split(":")[0]
-                        if row_driver not in optimized_drivers:
-                            existing_rows.append(row)
-                    elif len(row) > 9 and row[9]:
-                        import re as _re
-                        driver_match = _re.match(r'([A-Za-z]+)', row[9])
-                        if driver_match and driver_match.group(1) not in optimized_drivers:
-                            existing_rows.append(row)
+                # Merge: ALWAYS keep rows for drivers NOT being re-optimized,
+                # no matter how many drivers this run covers.
+                if len(row) > 0 and ":" in row[0]:
+                    row_driver = row[0].split(":")[0]
+                    if row_driver not in optimized_drivers:
+                        existing_rows.append(row)
+                elif len(row) > 9 and row[9]:
+                    import re as _re
+                    driver_match = _re.match(r'([A-Za-z]+)', row[9])
+                    if driver_match and driver_match.group(1) not in optimized_drivers:
+                        existing_rows.append(row)
         # Different date or no header match — full rewrite, no merge
         
         sheet.del_worksheet(existing_ws)
@@ -1561,7 +1562,13 @@ def build_driver_checklist(results, ride_alongs=None):
             ])
     
     # Sort by driver, then group
-    checklist.sort(key=lambda x: (x[2], x[1], x[0]))
+    def _ck_key(x):
+        # driver (case-insensitive) -> trip number -> dog name (ignoring emojis)
+        _m = re.search(r"(\d+)$", x[1] or "")
+        _trip = int(_m.group(1)) if _m else 0
+        _nm = re.sub(r"[^A-Za-z0-9 ]", "", x[0] or "").strip().lower()
+        return (x[2].strip().lower(), _trip, _nm)
+    checklist.sort(key=_ck_key)
     
     return checklist
 
