@@ -69,7 +69,9 @@ def solve_simple_trip(matrix, stop_ids, start_id, end_id, time_limit=1):
 
 def solve_interleaved_trip(matrix, dropoff_customers, pickup_customers,
                            start_id, end_id, capacity, initial_load,
-                           time_limit=3):
+                           time_limit=3,
+                           front_drop_ids=None, front_pick_ids=None,
+                           front_initial=0):
     """
     Solve an interleaved trip: drop off one group while picking up the next.
     
@@ -119,6 +121,27 @@ def solve_interleaved_trip(matrix, dropoff_customers, pickup_customers,
 
     dcb = routing.RegisterUnaryTransitCallback(demand_cb)
     routing.AddDimension(dcb, 0, capacity, True, 'Capacity')
+
+    # Front seat: FRNT dogs ride up front and there is only ONE front seat.
+    # A second capacity-1 dimension forces any FRNT drop-off to happen before
+    # the next FRNT pickup. Only added when the caller passes front info.
+    front_drop_ids = front_drop_ids or set()
+    front_pick_ids = front_pick_ids or set()
+    if front_initial or front_drop_ids or front_pick_ids:
+        front_demands = [0] * n
+        front_demands[0] = front_initial
+        for i, (cid, _) in enumerate(dropoff_customers):
+            if cid in front_drop_ids:
+                front_demands[1 + i] = -1
+        for i, (cid, _) in enumerate(pickup_customers):
+            if cid in front_pick_ids:
+                front_demands[1 + n_drop + i] = 1
+
+        def front_cb(fi):
+            return front_demands[manager.IndexToNode(fi)]
+
+        fcb = routing.RegisterUnaryTransitCallback(front_cb)
+        routing.AddDimension(fcb, 0, 1, True, 'FrontSeat')
 
     params = pywrapcp.DefaultRoutingSearchParameters()
     params.first_solution_strategy = (
