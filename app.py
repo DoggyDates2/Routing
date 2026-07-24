@@ -1789,13 +1789,14 @@ def main():
     _damaged_ids = sorted(
         rid for rid, drow in matrix.items()
         if not ANCHOR_ID_RE.match(rid) and drow
-        and sum(1 for v in drow.values() if float(v) >= 9000) > len(drow) * 0.5
+        and sum(1 for v in drow.values() if float(v) >= 9000) > len(drow) * 0.9
     )
     if _damaged_ids:
         st.warning(
-            f"🩹 {len(_damaged_ids)} dog(s) in the matrix have mostly-9999 rows from failed "
-            f"adds: {', '.join(_damaged_ids)}. Remove them so they can be re-added cleanly "
-            f"once the ORS quota resets."
+            f"🩹 {len(_damaged_ids)} dog(s) in the matrix have almost entirely 9999 rows "
+            f"(>90% — a failed add): {', '.join(_damaged_ids)}. Remove them so they can be "
+            f"re-added cleanly. (Dogs with real distances to their nearby area are healthy "
+            f"even if far-away pairs are 9999 — those are by design and not flagged.)"
         )
         if st.button(f"🗑 Remove {len(_damaged_ids)} damaged dog(s) from matrix"):
             with st.spinner("Purging damaged rows from matrix.csv..."):
