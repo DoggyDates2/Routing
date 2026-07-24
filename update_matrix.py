@@ -280,9 +280,13 @@ def add_dogs_to_matrix(creds, matrix, missing_dogs, schedule_data, file_id, matr
 
     # Also load field/parking coordinates from Locations tab
     try:
-        sheet_name = os.environ.get("ROUTING_SHEET_NAME", "Routing")
         client = gspread.authorize(creds)
-        loc_sheet = client.open(sheet_name)
+        routing_sheet_id = os.environ.get("ROUTING_SHEET_ID", "").strip()
+        if routing_sheet_id:
+            loc_sheet = client.open_by_key(routing_sheet_id)
+        else:
+            sheet_name = os.environ.get("ROUTING_SHEET_NAME", "Routing")
+            loc_sheet = client.open(sheet_name)
         loc_ws = loc_sheet.worksheet("Locations")
         loc_data = loc_ws.get_all_values()
         for row in loc_data[1:]:
@@ -297,6 +301,14 @@ def add_dogs_to_matrix(creds, matrix, missing_dogs, schedule_data, file_id, matr
         print(f"  Loaded {sum(1 for k in existing_with_coords if k.endswith('F') or k.endswith('P'))} field/parking coordinates from Locations tab")
     except Exception as e:
         print(f"  Warning: could not load Locations tab: {e}")
+
+    _fp_loaded = sum(1 for k in existing_with_coords if k.endswith("F") or k.endswith("P"))
+    if _fp_loaded == 0:
+        print("  🛑 ZERO field/parking coordinates loaded — dogs added now would be "
+              "unreachable from every field and parking lot. NOT adding any dogs this run. "
+              "Fix the Locations tab access (set ROUTING_SHEET_ID or ROUTING_SHEET_NAME "
+              "secret; share the Routing sheet with the service account).")
+        return matrix, 0
 
     existing_ids = list(existing_with_coords.keys())
     existing_coords = [[existing_with_coords[eid]["lng"], existing_with_coords[eid]["lat"]]
@@ -313,6 +325,7 @@ def add_dogs_to_matrix(creds, matrix, missing_dogs, schedule_data, file_id, matr
     data_rows = all_rows[1:]
 
     _ORS_QUOTA_HIT["v"] = False
+    added_count = 0
     for new_id, new_coords in missing_dogs.items():
         if _ORS_QUOTA_HIT["v"]:
             print("    Daily ORS quota exhausted — skipping remaining dogs this run.")
@@ -418,12 +431,17 @@ def add_dogs_to_matrix(creds, matrix, missing_dogs, schedule_data, file_id, matr
             else:
                 new_row.append(str(new_to_existing.get(col_id, 9999)))
         data_rows.append(new_row)
+        added_count += 1
 
         existing_ids.append(new_id)
         existing_coords.append(new_loc)
 
+    if added_count == 0:
+        print("No dogs were actually added — skipping upload (matrix unchanged).")
+        return matrix, 0
+
     # Upload updated CSV
-    print("Uploading updated matrix to Drive...")
+    print(f"Uploading updated matrix to Drive ({added_count} dog(s) added)...")
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow(header)
@@ -437,6 +455,7 @@ def add_dogs_to_matrix(creds, matrix, missing_dogs, schedule_data, file_id, matr
     )
     drive.files().update(fileId=file_id, media_body=media).execute()
     print("Done!")
+    return matrix, added_count
 
 
 def main():
@@ -479,8 +498,11 @@ def main():
         print(f"⚠️ Found {len(missing)} new dog(s) to add:")
         for cid, coords in missing.items():
             print(f"  • {cid} — ({coords['lat']}, {coords['lng']})")
-        add_dogs_to_matrix(creds, matrix, missing, schedule_data, file_id, matrix_text, ors_key)
-        print(f"✅ Added {len(missing)} dog(s).")
+        _mx, _added = add_dogs_to_matrix(creds, matrix, missing, schedule_data, file_id, matrix_text, ors_key)
+        if _added:
+            print(f"✅ Added {_added} of {len(missing)} dog(s); the rest stay queued for a future run.")
+        else:
+            print(f"ℹ️ Added 0 of {len(missing)} dog(s) this run (quota or Locations issue above); all stay queued.")
         # Reload matrix after adding
         matrix, file_id, matrix_text = load_matrix_from_drive(creds, matrix_file_name)
 
