@@ -729,7 +729,7 @@ def write_results_to_sheet(client, sheet_name, new_results, optimized_drivers, s
         ws.update(range_name="A3", values=all_rows)
 
     # Checklist header and data (columns M-O)
-    checklist_header = ["Dog", "Group", "Driver"]
+    checklist_header = ["Dog", "Trip", "Driver"]
     ws.update(range_name="M1", values=[[selected_date]])
     ws.update(range_name="M2", values=[checklist_header])
     if checklist_rows:
@@ -1156,7 +1156,7 @@ def surgical_apply(client, sheet_name, matrix, driver_name, config, assignments,
     if final_rows:
         ws.update(range_name="A3", values=final_rows)
     ws.update(range_name="M1", values=[[selected_date]])
-    ws.update(range_name="M2", values=[["Dog", "Group", "Driver"]])
+    ws.update(range_name="M2", values=[["Dog", "Trip", "Driver"]])
     if checklist_rows:
         ws.update(range_name="M3", values=checklist_rows)
     return report
@@ -1242,7 +1242,7 @@ def build_driver_checklist(results):
             emoji = group_emoji.get(g, "")
             checklist.append([
                 f"{emoji}{dog_name}",
-                g,
+                f"{driver}{g}",
                 driver,
             ])
     
