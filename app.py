@@ -190,6 +190,28 @@ def parse_route_date(label):
         return None
 
 
+def parse_any_date(raw):
+    """Parse a date from a Staff-tab A1 cell in any common format.
+    Returns a date object, or None if the cell has no recognizable date."""
+    from datetime import datetime, date
+    s = (raw or "").strip()
+    if not s:
+        return None
+    d = parse_route_date(s)  # "Thursday July 24"
+    if d:
+        return d
+    for fmt in ("%m/%d/%Y", "%m/%d/%y", "%Y-%m-%d", "%B %d, %Y", "%B %d %Y",
+                "%A, %B %d, %Y", "%A %B %d %Y"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            pass
+    try:  # "7/24" without a year
+        return datetime.strptime(s, "%m/%d").date().replace(year=date.today().year)
+    except ValueError:
+        return None
+
+
 def birthday_symbols(bdays, route_date):
     """Customer name (lower) -> emoji prefix for PICKUP rows.
     H before route date: nothing (missed — no action).
@@ -2071,6 +2093,33 @@ def main():
     if st.session_state.get("date_select") not in _date_labels:
         st.session_state["date_select"] = _date_labels[_default_idx]
     selected_date = st.selectbox("Select date:", _date_labels, key="date_select")
+
+    # ── Staff tab date check: A1 holds the date the Staff tab is set up for.
+    #    If it doesn't match the selected route date, use YESTERDAYSTAFF instead.
+    #    A blank / non-date A1 means no date tracking — use Staff as always. ──
+    _staff_a1 = parse_any_date(staff_data[0][0] if staff_data and staff_data[0] else "")
+    _sel_d = parse_route_date(selected_date)
+    if _staff_a1 and _sel_d and _staff_a1 != _sel_d:
+        _y_data = None
+        try:
+            _y_data = client.open(SHEET_NAME).worksheet("YESTERDAYSTAFF").get_all_values()
+        except Exception:
+            _y_data = None
+        _y_a1 = parse_any_date(_y_data[0][0] if _y_data and _y_data[0] else "")
+        if _y_data and _y_a1 == _sel_d:
+            staff_data = _y_data
+            drivers = parse_staff(staff_data)
+            st.info(f"ℹ️ Staff tab is dated {_staff_a1.strftime('%A %B %-d')} — using the "
+                    f"YESTERDAYSTAFF tab for {selected_date}.")
+        elif _y_data is None:
+            st.warning(f"⚠️ Staff tab A1 is dated {_staff_a1.strftime('%A %B %-d')}, not "
+                       f"{selected_date}, and no YESTERDAYSTAFF tab was found — using the "
+                       f"Staff tab anyway. Double-check driver info.")
+        else:
+            _y_txt = _y_a1.strftime('%A %B %-d') if _y_a1 else "no date in A1"
+            st.warning(f"⚠️ Neither Staff ({_staff_a1.strftime('%A %B %-d')}) nor "
+                       f"YESTERDAYSTAFF ({_y_txt}) matches {selected_date} — using the "
+                       f"Staff tab anyway. Double-check driver info.")
     date_col_idx = available_dates[selected_date]["col_idx"]
 
     # Reset checkboxes when date changes
