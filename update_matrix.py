@@ -154,6 +154,10 @@ def geocode_missing_coords(creds, schedule_data, schedule_sheet_id, matrix, ors_
         if idx < 2:
             continue
         cid = row[6].strip() if len(row) > 6 else ""
+        # Staff dogs (no email in col E) are never routed — they don't need
+        # coordinates or matrix entries.
+        if not (row[4].strip() if len(row) > 4 else ""):
+            continue
         lat = row[8].strip() if len(row) > 8 else ""
         lng = row[9].strip() if len(row) > 9 else ""
         addr = row[0].strip() if len(row) > 0 else ""
@@ -205,6 +209,9 @@ def find_missing_dogs(matrix, schedule_data):
     # We care about any dog that might be scheduled, not just today
     for row in schedule_data[2:]:  # skip header + sub-header
         cid = row[6].strip() if len(row) > 6 else ""
+        # Staff dogs (no email in col E) are never routed — skip; no matrix entry needed.
+        if not (row[4].strip() if len(row) > 4 else ""):
+            continue
         lat = row[8].strip() if len(row) > 8 else ""
         lng = row[9].strip() if len(row) > 9 else ""
 
