@@ -817,7 +817,7 @@ def write_results_to_sheet(client, sheet_name, new_results, optimized_drivers, s
     """Write routes to sheet with date tracking."""
     sheet = client.open(sheet_name)
     
-    header = ["Assignment", "Min to Next", "Dog Name", "Address", "Phone",
+    header = ["Assignment", "Stop", "Dog Name", "Address", "Phone",
               "Customer Name", "Instructions", "Dog Breed", "House Description",
               "Driver Trip", "Customer ID"]
 
@@ -876,6 +876,7 @@ def write_results_to_sheet(client, sheet_name, new_results, optimized_drivers, s
         _bd_syms = {}
 
     new_rows = []
+    _seq_counts = {}  # per-trip stop sequence for column B
     for r in new_results:
         driver_trip = f"{r.get('Driver', '')}{r.get('Leg', '')}"
         cid = r.get("Customer ID", "")
@@ -892,9 +893,10 @@ def write_results_to_sheet(client, sheet_name, new_results, optimized_drivers, s
             if _s:
                 dog_name = _s + strip_birthday_symbols(dog_name)
 
+        _seq_counts[driver_trip] = _seq_counts.get(driver_trip, 0) + 1
         new_rows.append([
             r.get("Assignment", ""),
-            r.get("Min to Next", ""),
+            _seq_counts[driver_trip],
             dog_name,
             r.get("Address", ""),
             r.get("Phone", ""),
@@ -1470,13 +1472,19 @@ def surgical_apply(client, sheet_name, matrix, driver_name, config, assignments,
     if final_rows is None:
         return []
 
-    header = ["Assignment", "Min to Next", "Dog Name", "Address", "Phone",
+    header = ["Assignment", "Stop", "Dog Name", "Address", "Phone",
               "Customer Name", "Instructions", "Dog Breed", "House Description",
               "Driver Trip", "Customer ID"]
     checklist_rows = build_driver_checklist(
         rows_to_checklist_results(final_rows),
         [a for a in assignments if a.get("is_ride_along") and not a["is_staff_dog"]],
     )
+    _seq = {}
+    for _r in final_rows:
+        _t = (_r[9] or "").strip()
+        _seq[_t] = _seq.get(_t, 0) + 1
+        _r[1] = _seq[_t]
+
     max_rows = max(len(final_rows), len(checklist_rows)) + 2
     sheet.del_worksheet(ws)
     ws = sheet.add_worksheet(title=OUTPUT_TAB_NAME, rows=max_rows, cols=15)
