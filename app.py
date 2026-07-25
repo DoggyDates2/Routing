@@ -1348,7 +1348,11 @@ def _surgical_compute(rows, matrix, driver_name, config, assignments, schedule_l
         is_final = (td == max(trip_rows))
         def row_for(c):
             if c == new_a["customer_id"]:
-                return make_row(new_a, td)
+                r = make_row(new_a, td)
+                # this row is the dog's DROP OFF — give it the drop symbol
+                if not r[2].startswith("\u25fc"):
+                    r[2] = "\u25fc" + r[2]
+                return r
             return row_by_cid[c]
         if is_final and not picks:
             res = solve_simple_trip(matrix, [c for c, _ in drops],
@@ -2772,10 +2776,23 @@ def main():
     _opts = []
     if changes:
         for _drv in sorted(changes.keys()):
-            for _cid, _raw in sorted(changes[_drv].get("added", set())):
+            _added = dict(changes[_drv].get("added", set()))
+            _removed = dict(changes[_drv].get("removed", set()))
+            _moved = set(_added) & set(_removed)
+            # A dog in BOTH lists is one MOVE — applying it removes the old stops
+            # AND adds the new ones in a single pass, so show one honest entry.
+            for _cid in sorted(_moved):
+                _nm = _name_by_cid.get(_cid, _cid)[:10]
+                _opts.append((f"Move {_nm}: {_removed[_cid]} → {_added[_cid]} "
+                              f"(removes old stops + adds new ones)", _drv, _cid))
+            for _cid, _raw in sorted(_added.items()):
+                if _cid in _moved:
+                    continue
                 _nm = _name_by_cid.get(_cid, _cid)[:10]
                 _opts.append((f"{_raw}  Add {_nm}", _drv, _cid))
-            for _cid, _raw in sorted(changes[_drv].get("removed", set())):
+            for _cid, _raw in sorted(_removed.items()):
+                if _cid in _moved:
+                    continue
                 _nm = _name_by_cid.get(_cid, _cid)[:10]
                 _opts.append((f"{_raw}  Remove {_nm}", _drv, _cid))
     if not _opts:
