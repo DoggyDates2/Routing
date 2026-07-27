@@ -837,7 +837,13 @@ def write_results_to_sheet(client, sheet_name, new_results, optimized_drivers, s
         # comparing the whole padded row silently disabled merging and caused partial
         # optimizes to wipe the other drivers' routes.
         _row2 = [c.strip() for c in existing_data[1][:len(header)]] if len(existing_data) > 1 else []
-        if same_date and _row2 == header:
+        # Header-compatible = same shape, ignoring renamed column labels (e.g. the
+        # "Min to Next" -> "Stop" rename): anchor on the first and last columns so a
+        # label change never silently disables merging and wipes other drivers.
+        _hdr_ok = (len(_row2) == len(header)
+                   and _row2 and _row2[0] == header[0]
+                   and _row2[-1] == header[-1])
+        if same_date and _hdr_ok:
             # Same date — check for manual name edits and merge
             for row in existing_data[2:]:  # skip date row and header
                 if len(row) > 10 and row[10]:
