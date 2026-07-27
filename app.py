@@ -1917,6 +1917,7 @@ def auto_add_to_matrix(client, matrix, missing_dogs, schedule_data):
 
     progress = st.progress(0, text="Starting matrix update...")
     total = len(missing_dogs)
+    added_count = 0
     completed = 0
 
     _ORS_QUOTA_HIT["v"] = False  # fresh run, fresh verdict
@@ -2046,6 +2047,7 @@ def auto_add_to_matrix(client, matrix, missing_dogs, schedule_data):
         # Add to existing lists for subsequent dogs
         existing_ids.append(new_id)
         existing_coords.append(new_loc)
+        added_count += 1
 
     # Upload updated CSV to Drive
     progress.progress(1.0, text="Uploading updated matrix...")
@@ -2065,7 +2067,14 @@ def auto_add_to_matrix(client, matrix, missing_dogs, schedule_data):
     while response is None:
         _, response = request.next_chunk()
 
-    st.success(f"✅ Added {total} dog(s) to matrix automatically.")
+    if added_count == total:
+        st.success(f"✅ Added {added_count} dog(s) to matrix automatically.")
+    elif added_count > 0:
+        st.warning(f"⚠️ Added {added_count} of {total} dog(s) — the rest hit the ORS quota "
+                   f"and stay missing until it resets (the scheduled runs will pick them up).")
+    else:
+        st.warning(f"⚠️ No dogs could be added this run (ORS quota) — all {total} stay "
+                   f"missing until the quota resets; the scheduled runs will pick them up.")
     return matrix
 
 
