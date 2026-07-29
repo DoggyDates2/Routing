@@ -248,7 +248,7 @@ def get_active_temps(temp_rows, route_date):
             if orig in active:
                 problems.append(f"{orig} has overlapping temp addresses — using the first")
                 continue
-            label = (row[6].strip() if len(row) > 6 else "") or "NEW ADDRESS"
+            label = (row[6].strip() if len(row) > 6 else "") or "DIFF ADDRESS"
             active[orig] = (temp, addr, label)
     return active, problems
 
@@ -373,7 +373,7 @@ def strip_display_prefixes(name):
         nm2 = strip_birthday_symbols(nm)
         if nm2 != nm:
             nm, changed = nm2, True
-        _toks = ["◼", "2️⃣", "3️⃣", "😎", "NEW ADDRESS "]
+        _toks = ["◼", "2️⃣", "3️⃣", "😎", "NEW ADDRESS ", "DIFF ADDRESS "]
         _toks += sorted((_l + " " for _l in _TEMP_NAME_LABELS), key=len, reverse=True)
         for tok in _toks:
             if nm.startswith(tok):
@@ -682,7 +682,7 @@ def solve_driver(matrix, driver_name, config, dogs, schedule_lookup):
                 ds = _nn_order(ds)
                 if not ds:
                     continue
-                leg += 1
+                leg = g if action == "PICK UP" else g + 1
                 for i, d in enumerate(ds):
                     load += d["dog_count"] if action == "PICK UP" else -d["dog_count"]
                     extra = get_extra_info(d["customer_id"])
@@ -744,7 +744,7 @@ def solve_driver(matrix, driver_name, config, dogs, schedule_lookup):
                         display_name = get_dog_display_name(loc_id, action)
                         addr = d.get("address", "")
                     results.append({
-                        "Driver": driver_name, "Leg": leg_num + 1, "Stop": i + 1,
+                        "Driver": driver_name, "Leg": groups[0], "Stop": i + 1,
                         "Action": action, "Customer ID": loc_id,
                         "Dog Name": display_name, "Address": addr,
                         "Phone": extra.get("Phone", ""),
@@ -758,7 +758,7 @@ def solve_driver(matrix, driver_name, config, dogs, schedule_lookup):
                     })
             else:
                 results.append({
-                    "Driver": driver_name, "Leg": leg_num + 1, "Stop": 0,
+                    "Driver": driver_name, "Leg": groups[0], "Stop": 0,
                     "Action": "⚠️ FAILED", "Customer ID": "",
                     "Dog Name": f"Leg FAILED: {len(pickup_dogs)} stops, {total_dogs} dogs, capacity {capacity}",
                     "Address": "", "Phone": "", "Customer Name": "",
@@ -863,7 +863,7 @@ def solve_driver(matrix, driver_name, config, dogs, schedule_lookup):
                         display_name = get_dog_display_name(loc_id, action_raw)
                         addr = d.get("address", "")
                     results.append({
-                        "Driver": driver_name, "Leg": leg_num + 1, "Stop": i + 1,
+                        "Driver": driver_name, "Leg": next_group, "Stop": i + 1,
                         "Action": action_raw, "Customer ID": loc_id,
                         "Dog Name": display_name, "Address": addr,
                         "Phone": extra.get("Phone", ""),
@@ -877,7 +877,7 @@ def solve_driver(matrix, driver_name, config, dogs, schedule_lookup):
                     })
             else:
                 results.append({
-                    "Driver": driver_name, "Leg": leg_num + 1, "Stop": 0,
+                    "Driver": driver_name, "Leg": next_group, "Stop": 0,
                     "Action": "⚠️ FAILED", "Customer ID": "",
                     "Dog Name": f"Interleaved leg FAILED: drop {len(dropoffs)} ({dogs_being_dropped} dogs) + pick {len(pickups)} ({dogs_being_picked} dogs) + {staying_customer + staying_staff} staying = {initial_load} initial load, capacity {capacity}",
                     "Address": "", "Phone": "", "Customer Name": "",
@@ -914,7 +914,7 @@ def solve_driver(matrix, driver_name, config, dogs, schedule_lookup):
                         display_name = get_dog_display_name(loc_id, action)
                         addr = d.get("address", "")
                     results.append({
-                        "Driver": driver_name, "Leg": leg_num + 1, "Stop": i + 1,
+                        "Driver": driver_name, "Leg": groups[-1] + 1, "Stop": i + 1,
                         "Action": action, "Customer ID": loc_id,
                         "Dog Name": display_name, "Address": addr,
                         "Phone": extra.get("Phone", ""),
