@@ -200,6 +200,33 @@ def geocode_missing_coords(creds, schedule_data, schedule_sheet_id, matrix, ors_
     return fixed
 
 
+def find_missing_temp_addresses(creds, sheet_id, matrix, ors_key):
+    """TempAddresses tab (A=orig ID, B=temp ID, C=temp address, D/E=dates).
+    Any temp ID not yet in the matrix gets geocoded and queued for adding —
+    regardless of dates, so addresses are ready ahead of time and reusable."""
+    import gspread
+    try:
+        gc = gspread.authorize(creds)
+        rows = gc.open_by_key(sheet_id).worksheet("TempAddresses").get_all_values()
+    except Exception:
+        return {}
+    queued = {}
+    # Layout: A=Customer Name, B=original ID, C=temp ID, D=temp address, E/F=dates
+    for row in rows[1:]:
+        temp = row[2].strip() if len(row) > 2 else ""
+        addr = row[3].strip() if len(row) > 3 else ""
+        if not temp or not addr or temp in matrix or temp in queued:
+            continue
+        res = ors_geocode(addr, ors_key)
+        if not res:
+            log(f"  ✗ temp address {temp}: could not geocode '{addr}'")
+            continue
+        lat, lng = res
+        queued[temp] = {"lat": lat, "lng": lng}
+        log(f"  + temp address {temp} @ '{addr[:40]}' queued for matrix add")
+    return queued
+
+
 def find_missing_dogs(matrix, schedule_data):
     """Find dogs in the Schedule that aren't in the matrix."""
     matrix_ids = set(matrix.keys())
@@ -498,6 +525,10 @@ def main():
     # Find missing
     geocode_missing_coords(creds, schedule_data, schedule_sheet_id, matrix, ors_key)
     missing = find_missing_dogs(matrix, schedule_data)
+    temp_missing = find_missing_temp_addresses(creds, schedule_sheet_id, matrix, ors_key)
+    if temp_missing:
+        print(f"TempAddresses: {len(temp_missing)} new temp ID(s) to add")
+        missing.update(temp_missing)
 
     if not missing:
         print("✅ No new dogs to add.")
