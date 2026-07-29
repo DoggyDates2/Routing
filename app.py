@@ -248,7 +248,8 @@ def get_active_temps(temp_rows, route_date):
             if orig in active:
                 problems.append(f"{orig} has overlapping temp addresses — using the first")
                 continue
-            active[orig] = (temp, addr)
+            label = (row[6].strip() if len(row) > 6 else "") or "NEW ADDRESS"
+            active[orig] = (temp, addr, label)
     return active, problems
 
 
@@ -359,6 +360,9 @@ def is_front_dog(name):
     return "FRNT" in (name or "").upper()
 
 
+_TEMP_NAME_LABELS = set()  # every label seen in TempAddresses col G this session
+
+
 def strip_display_prefixes(name):
     """Strip route display decorations (birthday symbols, dropoff ◼, split-trip
     2️⃣/3️⃣) to recover the base dog name. Real name emojis (💩 etc.) are kept."""
@@ -369,7 +373,9 @@ def strip_display_prefixes(name):
         nm2 = strip_birthday_symbols(nm)
         if nm2 != nm:
             nm, changed = nm2, True
-        for tok in ("◼", "2️⃣", "3️⃣", "😎", "NEW ADDRESS "):
+        _toks = ["◼", "2️⃣", "3️⃣", "😎", "NEW ADDRESS "]
+        _toks += sorted((_l + " " for _l in _TEMP_NAME_LABELS), key=len, reverse=True)
+        for tok in _toks:
             if nm.startswith(tok):
                 nm, changed = nm[len(tok):], True
         if nm != nm.lstrip():
@@ -2269,8 +2275,24 @@ def main():
             _default_idx = _i
             break
     if st.session_state.get("date_select") not in _date_labels:
-        st.session_state["date_select"] = _date_labels[_default_idx]
+        # The stored pick can stop matching after a data refresh re-derives the
+        # labels, and it's lost entirely on reboot. Recover it by PARSED DATE:
+        # first from the stale stored label, then from the URL pin (?d=...).
+        _want = parse_route_date(st.session_state.get("date_select") or "")
+        if _want is None:
+            try:
+                _want = parse_route_date(st.query_params.get("d", ""))
+            except Exception:
+                _want = None
+        _match = None
+        if _want is not None:
+            _match = next((l for l in _date_labels if parse_route_date(l) == _want), None)
+        st.session_state["date_select"] = _match or _date_labels[_default_idx]
     selected_date = st.selectbox("Select date:", _date_labels, key="date_select")
+    try:
+        st.query_params["d"] = selected_date  # pin the pick so reboots keep it
+    except Exception:
+        pass
 
     # ── Staff tab date check: A1 holds the date the Staff tab is set up for.
     #    If it doesn't match the selected route date, use YESTERDAYSTAFF instead.
@@ -2301,10 +2323,14 @@ def main():
     # ── Temporary pickup addresses (TempAddresses tab) ──
     _temp_rows = load_temp_addresses(client, schedule_sheet_id)
     _route_d = parse_route_date(selected_date)
+    for _tr in _temp_rows[1:]:
+        _g = _tr[6].strip() if len(_tr) > 6 else ""
+        if _g:
+            _TEMP_NAME_LABELS.add(_g.rstrip())
     _active_temps, _temp_problems = get_active_temps(_temp_rows, _route_d)
     for _p in _temp_problems:
         st.warning(f"⚠️ TempAddresses: {_p}")
-    _temp_missing = {o: t for o, (t, _a) in _active_temps.items() if t not in matrix}
+    _temp_missing = {o: t for o, (t, _a, _l) in _active_temps.items() if t not in matrix}
     if _temp_missing:
         st.warning(
             "⚠️ Temp address ID(s) not in the matrix yet: "
@@ -2313,7 +2339,7 @@ def main():
             "stop ORDER is planned from their home address, but the route sheet "
             "shows the temporary address so drivers go to the right place."
         )
-    _temp_redirect = {o: t for o, (t, _a) in _active_temps.items() if t in matrix}
+    _temp_redirect = {o: t for o, (t, _a, _l) in _active_temps.items() if t in matrix}
     if _temp_redirect:
         matrix = _TempMatrixView(matrix, _temp_redirect)
         st.info("📍 Temporary addresses active today: "
@@ -2335,7 +2361,8 @@ def main():
         for _a in assignments:
             if _a["customer_id"] in _active_temps:
                 _a["address"] = _active_temps[_a["customer_id"]][1]
-                _a["dog_name"] = "NEW ADDRESS " + _a["dog_name"]
+                _lbl = _active_temps[_a["customer_id"]][2]
+                _a["dog_name"] = _lbl.rstrip() + " " + _a["dog_name"]
 
     scheduled_names = sorted(set(a["driver"] for a in assignments if a.get("driver")))
     st.sidebar.markdown(f"**Drivers on schedule:** {len(scheduled_names)}")
