@@ -212,6 +212,117 @@ def parse_any_date(raw):
         return None
 
 
+@st.cache_data(show_spinner=False, ttl=300)
+def load_temp_addresses(_client, sheet_id):
+    """TempAddresses tab (Schedule spreadsheet): A=original ID, B=temp ID,
+    C=temp address, D=start date, E=end date. Missing tab -> empty list."""
+    try:
+        ws = _client.open_by_key(sheet_id).worksheet("TempAddresses")
+        return ws.get_all_values()
+    except Exception:
+        return []
+
+
+def get_active_temps(temp_rows, route_date):
+    """-> (active, problems). active: {orig_cid: (temp_cid, temp_addr)} for rows
+    whose date window covers route_date. A row needs both IDs, an address, and at
+    least one date; blank start = active through end, blank end = active from
+    start onward. Rows with BOTH dates blank are ignored (never auto-active)."""
+    active, problems = {}, []
+    if not route_date:
+        return active, problems
+    # Layout: A=Customer Name (human label/lookup), B=original ID, C=temp ID,
+    # D=temp address, E=start date, F=end date
+    for row in temp_rows[1:]:  # skip header
+        orig = row[1].strip() if len(row) > 1 else ""
+        temp = row[2].strip() if len(row) > 2 else ""
+        addr = row[3].strip() if len(row) > 3 else ""
+        if not orig and not temp and not addr:
+            continue  # blank row
+        start = parse_any_date(row[4] if len(row) > 4 else "")
+        end = parse_any_date(row[5] if len(row) > 5 else "")
+        if not orig or not temp or not addr or temp == orig or (start is None and end is None):
+            problems.append(f"row for '{orig or temp or addr[:20]}' is incomplete")
+            continue
+        if (start is None or start <= route_date) and (end is None or route_date <= end):
+            if orig in active:
+                problems.append(f"{orig} has overlapping temp addresses — using the first")
+                continue
+            active[orig] = (temp, addr)
+    return active, problems
+
+
+class _TempRowView:
+    """Read-only row wrapper redirecting temp-address IDs."""
+    __slots__ = ("_row", "_rd")
+
+    def __init__(self, row, rd):
+        self._row, self._rd = row, rd
+
+    def _k(self, k):
+        return self._rd.get(k, k)
+
+    def __getitem__(self, k):
+        return self._row[self._k(k)]
+
+    def get(self, k, default=None):
+        return self._row.get(self._k(k), default)
+
+    def __contains__(self, k):
+        return self._k(k) in self._row
+
+    def __iter__(self):
+        return iter(self._row)
+
+    def __len__(self):
+        return len(self._row)
+
+    def items(self):
+        return self._row.items()
+
+    def values(self):
+        return self._row.values()
+
+    def keys(self):
+        return self._row.keys()
+
+
+class _TempMatrixView:
+    """Read-only matrix wrapper: lookups for an original customer ID are served
+    by its temp-address ID, so the whole app routes the dog from the temporary
+    address while every display/snapshot keeps the original ID. The underlying
+    (cached) matrix is never mutated."""
+    __slots__ = ("_m", "_rd")
+
+    def __init__(self, m, redirect):
+        self._m, self._rd = m, redirect
+
+    def _k(self, k):
+        return self._rd.get(k, k)
+
+    def __getitem__(self, k):
+        return _TempRowView(self._m[self._k(k)], self._rd)
+
+    def get(self, k, default=None):
+        row = self._m.get(self._k(k))
+        return _TempRowView(row, self._rd) if row is not None else default
+
+    def __contains__(self, k):
+        return self._k(k) in self._m
+
+    def __iter__(self):
+        return iter(self._m)
+
+    def __len__(self):
+        return len(self._m)
+
+    def keys(self):
+        return self._m.keys()
+
+    def items(self):
+        return ((k, _TempRowView(v, self._rd)) for k, v in self._m.items())
+
+
 def birthday_symbols(bdays, route_date):
     """Customer name (lower) -> emoji prefix for PICKUP rows.
     H before route date: nothing (missed — no action).
@@ -258,7 +369,7 @@ def strip_display_prefixes(name):
         nm2 = strip_birthday_symbols(nm)
         if nm2 != nm:
             nm, changed = nm2, True
-        for tok in ("◼", "2️⃣", "3️⃣", "😎"):
+        for tok in ("◼", "2️⃣", "3️⃣", "😎", "NEW ADDRESS "):
             if nm.startswith(tok):
                 nm, changed = nm[len(tok):], True
         if nm != nm.lstrip():
@@ -2109,6 +2220,7 @@ def main():
 
     # ── Load matrix from Google Drive ──
     matrix = load_matrix_from_drive(client, MATRIX_FILE_NAME)
+
     st.sidebar.success(f"Matrix loaded: {len(matrix)} locations")
 
     # ── Load Staff from Routing sheet ──
@@ -2186,6 +2298,27 @@ def main():
             st.warning(f"⚠️ Neither Staff ({_staff_a1.strftime('%A %B %-d')}) nor "
                        f"YESTERDAYSTAFF ({_y_txt}) matches {selected_date} — using the "
                        f"Staff tab anyway. Double-check driver info.")
+    # ── Temporary pickup addresses (TempAddresses tab) ──
+    _temp_rows = load_temp_addresses(client, schedule_sheet_id)
+    _route_d = parse_route_date(selected_date)
+    _active_temps, _temp_problems = get_active_temps(_temp_rows, _route_d)
+    for _p in _temp_problems:
+        st.warning(f"⚠️ TempAddresses: {_p}")
+    _temp_missing = {o: t for o, (t, _a) in _active_temps.items() if t not in matrix}
+    if _temp_missing:
+        st.warning(
+            "⚠️ Temp address ID(s) not in the matrix yet: "
+            + ", ".join(sorted(_temp_missing.values()))
+            + " — the scheduled matrix runs will add them. Until then these dogs' "
+            "stop ORDER is planned from their home address, but the route sheet "
+            "shows the temporary address so drivers go to the right place."
+        )
+    _temp_redirect = {o: t for o, (t, _a) in _active_temps.items() if t in matrix}
+    if _temp_redirect:
+        matrix = _TempMatrixView(matrix, _temp_redirect)
+        st.info("📍 Temporary addresses active today: "
+                + ", ".join(f"{o} → {t}" for o, t in sorted(_temp_redirect.items())))
+
     date_col_idx = available_dates[selected_date]["col_idx"]
 
     # Reset checkboxes when date changes
@@ -2198,6 +2331,11 @@ def main():
         st.session_state.pop("errors", None)
 
     assignments = parse_schedule(schedule_data, date_col_idx)
+    if _active_temps:
+        for _a in assignments:
+            if _a["customer_id"] in _active_temps:
+                _a["address"] = _active_temps[_a["customer_id"]][1]
+                _a["dog_name"] = "NEW ADDRESS " + _a["dog_name"]
 
     scheduled_names = sorted(set(a["driver"] for a in assignments if a.get("driver")))
     st.sidebar.markdown(f"**Drivers on schedule:** {len(scheduled_names)}")
