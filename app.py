@@ -258,7 +258,7 @@ def strip_display_prefixes(name):
         nm2 = strip_birthday_symbols(nm)
         if nm2 != nm:
             nm, changed = nm2, True
-        for tok in ("◼", "2️⃣", "3️⃣"):
+        for tok in ("◼", "2️⃣", "3️⃣", "😎"):
             if nm.startswith(tok):
                 nm, changed = nm[len(tok):], True
         if nm != nm.lstrip():
@@ -340,6 +340,10 @@ def parse_schedule(schedule_data, date_col_idx):
         driver_name = parts[0].strip()
         code = parts[1].strip() if len(parts) > 1 else ""
 
+        # "Trial" anywhere in the code (e.g. Jon:1Trial1) = trial dog — show 😎
+        # in front of the name everywhere (routes, surgical, checklist).
+        is_trial = "trial" in code.lower()
+
         # "XX" in the code (e.g. 1XX23, upper or lower case) = ride-along dog:
         # rides in the van all day, takes capacity, shows on the checklist,
         # but gets NO pickup/dropoff stops in the route.
@@ -360,7 +364,7 @@ def parse_schedule(schedule_data, date_col_idx):
                     "dog_count": dog_count,
                     "is_staff_dog": (email == ""),
                     "is_ride_along": is_ride_along,
-                    "dog_name": dog_name,
+                    "dog_name": ("😎" + dog_name if is_trial else dog_name),
                     "address": address,
                     "raw": assignment_str,
                 })
@@ -376,7 +380,7 @@ def parse_schedule(schedule_data, date_col_idx):
                 "dog_count": dog_count,
                 "is_staff_dog": (email == ""),
                 "is_ride_along": is_ride_along,
-                "dog_name": dog_name,
+                "dog_name": ("😎" + dog_name if is_trial else dog_name),
                 "address": address,
                 "raw": assignment_str,
             })
