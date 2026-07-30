@@ -927,6 +927,39 @@ def solve_driver(matrix, driver_name, config, dogs, schedule_lookup):
                         "Drive Min": round(dist, 1) if loc_id == parking else "",
                     })
 
+    # ── NEVER-SKIP SAFETY PASS ──────────────────────────────────────────
+    # Every schedule dog MUST appear on the route. If any customer dog made
+    # it through all the legs without a row (whatever the cause), force it
+    # in at the end of its proper trips with a loud note. Out of order beats
+    # left off — always.
+    _routed_ids = {r.get("Customer ID", "") for r in results}
+    for d in customer_dogs:
+        if d["customer_id"] in _routed_ids:
+            continue
+        _inmx = "was in matrix" if d["customer_id"] in matrix else "NOT in matrix at solve time"
+        _note_row("⚠️ UNROUTED — FORCED IN",
+                  f"{d.get('dog_name') or d['customer_id']}: the optimizer produced no "
+                  f"stops for this dog ({_inmx}) — pickup/drop-off appended manually "
+                  f"at the end of its trips. Drive order for it is NOT optimized.")
+        _extra = get_extra_info(d["customer_id"])
+        for _act, _lg in (("PICK UP", d["pickup_group"]),
+                          ("DROP OFF", d["dropoff_group"] + 1)):
+            results.append({
+                "Driver": driver_name, "Leg": _lg, "Stop": 999,
+                "Action": _act, "Customer ID": d["customer_id"],
+                "Dog Name": get_dog_display_name(d["customer_id"], _act),
+                "Address": d.get("address", ""),
+                "Phone": _extra.get("Phone", ""),
+                "Customer Name": _extra.get("Customer Name", ""),
+                "Instructions": _extra.get("Instructions", ""),
+                "Dog Breed": _extra.get("Dog Breed", ""),
+                "House Description": _extra.get("House Description", ""),
+                "Dogs at Stop": d.get("dog_count", ""),
+                "Dogs on Board": "",
+                "Assignment": d.get("raw", "") or driver_name,
+                "Drive Min": "",
+            })
+
     return results
 
 
