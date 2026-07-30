@@ -219,11 +219,11 @@ def find_missing_temp_addresses(creds, sheet_id, matrix, ors_key):
             continue
         res = ors_geocode(addr, ors_key)
         if not res:
-            log(f"  ✗ temp address {temp}: could not geocode '{addr}'")
+            print(f"  ✗ temp address {temp}: could not geocode '{addr}'")
             continue
         lat, lng = res
         queued[temp] = {"lat": lat, "lng": lng}
-        log(f"  + temp address {temp} @ '{addr[:40]}' queued for matrix add")
+        print(f"  + temp address {temp} @ '{addr[:40]}' queued for matrix add")
     return queued
 
 
