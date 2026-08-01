@@ -249,7 +249,17 @@ def get_active_temps(temp_rows, route_date):
                 problems.append(f"{orig} has overlapping temp addresses — using the first")
                 continue
             label = (row[6].strip() if len(row) > 6 else "") or "DIFF ADDRESS"
-            active[orig] = (temp, addr, label)
+            _m = (row[7].strip().lower() if len(row) > 7 else "")
+            if _m in ("", "both"):
+                mode = "both"
+            elif _m.startswith("pick") or _m.startswith("pu"):
+                mode = "pickup"
+            elif _m.startswith("drop") or _m.startswith("do"):
+                mode = "dropoff"
+            else:
+                problems.append(f"{orig}: direction '{_m}' in col H not recognized — using both")
+                mode = "both"
+            active[orig] = (temp, addr, label, mode)
     return active, problems
 
 
@@ -569,6 +579,33 @@ def solve_driver(matrix, driver_name, config, dogs, schedule_lookup):
 
     dog_lookup = {d["customer_id"]: d for d in customer_dogs}
 
+    # One-direction temp addresses: redirect the matrix PER LEG by the role the
+    # dog plays in that leg. IDs stay original everywhere; only distances shift.
+    def _dir_rd(ds, role):
+        rd = {}
+        for d in ds:
+            td = d.get("temp_dir")
+            if td and td.get("mid") and td["mode"] == role:
+                rd[d["customer_id"]] = td["mid"]
+        return rd
+
+    def _leg_matrix(rd):
+        return _TempMatrixView(matrix, rd) if rd else matrix
+
+    def _apply_dir_temp_display(rows_out):
+        """Temp address + label only on the matching action's rows; the other
+        leg keeps the home address. Covers all paths incl. forced safety rows."""
+        for r in rows_out:
+            d = dog_lookup.get(r.get("Customer ID"), {})
+            td = d.get("temp_dir") if isinstance(d, dict) else None
+            if td and (
+                (td["mode"] == "pickup" and r.get("Action") == "PICK UP")
+                or (td["mode"] == "dropoff" and r.get("Action") == "DROP OFF")
+            ):
+                r["Address"] = td["addr"]
+                r["Dog Name"] = td["label"] + " " + (r.get("Dog Name") or "")
+        return rows_out
+
     # Build a set of all customer_ids that have a ! assignment (split groups)
     split_dogs = {}
     for d in customer_dogs:
@@ -658,15 +695,16 @@ def solve_driver(matrix, driver_name, config, dogs, schedule_lookup):
             _front_warn(f"{', '.join(_fr)} are all on this driver, which has no field "
                         f"structure to sequence the front seat around.")
 
-        def _nn_order(ds):
+        def _nn_order(ds, rd=None):
             remaining = list(ds)
             if not remaining:
                 return []
+            _m2 = _leg_matrix(rd)
             ordered = [remaining.pop(0)]
             while remaining:
                 last = ordered[-1]["customer_id"]
                 nxt = min(remaining,
-                          key=lambda d: float(matrix.get(last, {}).get(d["customer_id"], 9999)))
+                          key=lambda d: float(_m2.get(last, {}).get(d["customer_id"], 9999)))
                 remaining.remove(nxt)
                 ordered.append(nxt)
             return ordered
@@ -679,7 +717,7 @@ def solve_driver(matrix, driver_name, config, dogs, schedule_lookup):
             drops = [d for d in customer_dogs
                      if d["dropoff_group"] == g or (g == last_g and d["dropoff_group"] > g)]
             for action, ds in (("PICK UP", picks), ("DROP OFF", drops)):
-                ds = _nn_order(ds)
+                ds = _nn_order(ds, _dir_rd(ds, "pickup" if action == "PICK UP" else "dropoff"))
                 if not ds:
                     continue
                 leg = g if action == "PICK UP" else g + 1
@@ -701,7 +739,7 @@ def solve_driver(matrix, driver_name, config, dogs, schedule_lookup):
                         "Assignment": d.get("raw", "") or driver_name,
                         "Drive Min": "",
                     })
-        return results
+        return _apply_dir_temp_display(results)
 
     for leg_num in range(len(groups) + 1):
 
@@ -724,7 +762,8 @@ def solve_driver(matrix, driver_name, config, dogs, schedule_lookup):
 
             stop_ids = [d["customer_id"] for d in pickup_dogs]
             total_dogs = sum(d["dog_count"] for d in pickup_dogs)
-            result = solve_simple_trip(matrix, stop_ids, parking, field)
+            result = solve_simple_trip(_leg_matrix(_dir_rd(pickup_dogs, "pickup")),
+                                       stop_ids, parking, field)
 
             if result:
                 route, dist = result
@@ -827,24 +866,31 @@ def solve_driver(matrix, driver_name, config, dogs, schedule_lookup):
                                  front_pick_ids=front_pick_ids,
                                  front_initial=front_initial)
 
+            _ileg_rd = {}
+            _ileg_rd.update(_dir_rd([d for d in customer_dogs
+                                     if d["dropoff_group"] == prev_group], "dropoff"))
+            _ileg_rd.update(_dir_rd([d for d in customer_dogs
+                                     if d["pickup_group"] == next_group], "pickup"))
+            _im = _leg_matrix(_ileg_rd)
+
             result = solve_interleaved_trip(
-                matrix, dropoffs, pickups, field, field, capacity, initial_load, **_front_kw
+                _im, dropoffs, pickups, field, field, capacity, initial_load, **_front_kw
             )
 
             # If capacity is too tight, retry with relaxed limit
             if result is None:
                 result = solve_interleaved_trip(
-                    matrix, dropoffs, pickups, field, field, capacity + 4, initial_load, **_front_kw
+                    _im, dropoffs, pickups, field, field, capacity + 4, initial_load, **_front_kw
                 )
 
             # Never let the front-seat rule kill a route: drop it, warn, retry
             if result is None and _front_kw:
                 result = solve_interleaved_trip(
-                    matrix, dropoffs, pickups, field, field, capacity, initial_load
+                    _im, dropoffs, pickups, field, field, capacity, initial_load
                 )
                 if result is None:
                     result = solve_interleaved_trip(
-                        matrix, dropoffs, pickups, field, field, capacity + 4, initial_load
+                        _im, dropoffs, pickups, field, field, capacity + 4, initial_load
                     )
                 if result is not None:
                     _front_warn(f"couldn't order stops to keep only one FRNT dog up front "
@@ -896,7 +942,8 @@ def solve_driver(matrix, driver_name, config, dogs, schedule_lookup):
                 continue
 
             stop_ids = [d["customer_id"] for d in dropoff_dogs]
-            result = solve_simple_trip(matrix, stop_ids, field, parking)
+            result = solve_simple_trip(_leg_matrix(_dir_rd(dropoff_dogs, "dropoff")),
+                                       stop_ids, field, parking)
 
             if result:
                 route, dist = result
@@ -960,7 +1007,7 @@ def solve_driver(matrix, driver_name, config, dogs, schedule_lookup):
                 "Drive Min": "",
             })
 
-    return results
+    return _apply_dir_temp_display(results)
 
 
 # =============================================================================
@@ -2363,7 +2410,7 @@ def main():
     _active_temps, _temp_problems = get_active_temps(_temp_rows, _route_d)
     for _p in _temp_problems:
         st.warning(f"⚠️ TempAddresses: {_p}")
-    _temp_missing = {o: t for o, (t, _a, _l) in _active_temps.items() if t not in matrix}
+    _temp_missing = {o: t for o, (t, _a, _l, _m) in _active_temps.items() if t not in matrix}
     if _temp_missing:
         st.warning(
             "⚠️ Temp address ID(s) not in the matrix yet: "
@@ -2372,7 +2419,8 @@ def main():
             "stop ORDER is planned from their home address, but the route sheet "
             "shows the temporary address so drivers go to the right place."
         )
-    _temp_redirect = {o: t for o, (t, _a, _l) in _active_temps.items() if t in matrix}
+    _temp_redirect = {o: t for o, (t, _a, _l, _m) in _active_temps.items()
+                      if t in matrix and _m == "both"}
     if _temp_redirect:
         matrix = _TempMatrixView(matrix, _temp_redirect)
         st.info("📍 Temporary addresses active today: "
@@ -2393,9 +2441,15 @@ def main():
     if _active_temps:
         for _a in assignments:
             if _a["customer_id"] in _active_temps:
-                _a["address"] = _active_temps[_a["customer_id"]][1]
-                _lbl = _active_temps[_a["customer_id"]][2]
-                _a["dog_name"] = _lbl.rstrip() + " " + _a["dog_name"]
+                _t, _ad, _lbl, _m = _active_temps[_a["customer_id"]]
+                if _m == "both":
+                    _a["address"] = _ad
+                    _a["dog_name"] = _lbl.rstrip() + " " + _a["dog_name"]
+                else:
+                    # one-direction temp: the other leg keeps the home address;
+                    # routing + display handled per-action inside solve_driver
+                    _a["temp_dir"] = {"mode": _m, "addr": _ad, "label": _lbl.rstrip(),
+                                      "mid": _t if _t in matrix else None}
 
     scheduled_names = sorted(set(a["driver"] for a in assignments if a.get("driver")))
     st.sidebar.markdown(f"**Drivers on schedule:** {len(scheduled_names)}")
