@@ -368,7 +368,7 @@ def add_dogs_to_matrix(creds, matrix, missing_dogs, schedule_data, file_id, matr
         new_loc = [new_coords["lng"], new_coords["lat"]]
         new_to_existing = {}
         existing_to_new = {}
-        batch_size = 25
+        batch_size = 500
 
         # Haversine pre-filter: only compute ORS for nearby dogs + all fields/parking
         import math
@@ -620,65 +620,54 @@ def repair_9999s(creds, matrix, schedule_data, file_id, matrix_text, ors_key):
     for i, row in enumerate(data_rows):
         row_idx[row[0].strip()] = i
 
-    # Process pairs via ORS
+    # Process pairs via ORS — grouped by source so ONE call covers up to 500
+    # pairs (the old per-pair version burned 2 API calls per pair — the quota
+    # killer that capped adds at ~3 dogs/day)
     fixed = 0
-    batch_size = 10  # ORS pairs per request
+    from collections import defaultdict
+    _fwd = defaultdict(list)   # from_id -> [to_id, ...]   fills matrix[from][to]
+    _rev = defaultdict(list)   # to_id   -> [from_id, ...] fills matrix[to][from]
+    for from_id, to_id in batch:
+        _fwd[from_id].append(to_id)
+        _rev[to_id].append(from_id)
 
-    for i in range(0, len(batch), batch_size):
+    def _fill_from_source(src_id, dest_ids):
+        filled = 0
+        for k in range(0, len(dest_ids), 500):
+            if _ORS_QUOTA_HIT["v"]:
+                return filled
+            chunk = dest_ids[k:k + 500]
+            locations = [[coords_lookup[src_id]["lng"], coords_lookup[src_id]["lat"]]] + [
+                [coords_lookup[d]["lng"], coords_lookup[d]["lat"]] for d in chunk
+            ]
+            resp = _ors_matrix_call(
+                "https://api.openrouteservice.org/v2/matrix/driving-car",
+                {"Authorization": ors_key, "Content-Type": "application/json"},
+                {"locations": locations, "sources": [0],
+                 "destinations": list(range(1, len(chunk) + 1)), "metrics": ["duration"]},
+                print,
+            )
+            if resp is not None and resp.status_code == 200:
+                durs = resp.json().get("durations", [[]])[0]
+                for j, d in enumerate(chunk):
+                    v = durs[j] if j < len(durs) else None
+                    if v is None:
+                        continue
+                    if src_id in row_idx and d in col_idx:
+                        data_rows[row_idx[src_id]][col_idx[d]] = str(round(v / 60, 1))
+                        filled += 1
+            time.sleep(2.0)
+        return filled
+
+    for _src, _dests in _fwd.items():
         if _ORS_QUOTA_HIT["v"]:
             print("    Daily ORS quota exhausted — stopping repair pass for this run.")
             break
-        sub_batch = batch[i:i + batch_size]
-
-        for from_id, to_id in sub_batch:
-            from_coords = coords_lookup[from_id]
-            to_coords = coords_lookup[to_id]
-
-            locations = [
-                [from_coords["lng"], from_coords["lat"]],
-                [to_coords["lng"], to_coords["lat"]]
-            ]
-
-            # Forward: from → to
-            try:
-                resp = requests.post(
-                    "https://api.openrouteservice.org/v2/matrix/driving-car",
-                    headers={"Authorization": ors_key, "Content-Type": "application/json"},
-                    json={"locations": locations, "sources": [0],
-                          "destinations": [1], "metrics": ["duration"]},
-                    timeout=30
-                )
-                if resp.status_code == 200:
-                    dur = resp.json().get("durations", [[]])[0][0]
-                    minutes = round(dur / 60, 1)
-
-                    # Update CSV
-                    if from_id in row_idx and to_id in col_idx:
-                        data_rows[row_idx[from_id]][col_idx[to_id]] = str(minutes)
-                        fixed += 1
-            except Exception:
-                pass
-
-            # Reverse: to → from
-            try:
-                resp = requests.post(
-                    "https://api.openrouteservice.org/v2/matrix/driving-car",
-                    headers={"Authorization": ors_key, "Content-Type": "application/json"},
-                    json={"locations": locations, "sources": [1],
-                          "destinations": [0], "metrics": ["duration"]},
-                    timeout=30
-                )
-                if resp.status_code == 200:
-                    dur = resp.json().get("durations", [[]])[0][0]
-                    minutes = round(dur / 60, 1)
-
-                    if to_id in row_idx and from_id in col_idx:
-                        data_rows[row_idx[to_id]][col_idx[from_id]] = str(minutes)
-                        fixed += 1
-            except Exception:
-                pass
-
-            time.sleep(2.0)
+        fixed += _fill_from_source(_src, _dests)
+    for _src, _dests in _rev.items():
+        if _ORS_QUOTA_HIT["v"]:
+            break
+        fixed += _fill_from_source(_src, _dests)
 
     if fixed > 0:
         print(f"  Fixed {fixed} entries. Uploading...")
