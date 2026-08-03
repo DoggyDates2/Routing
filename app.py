@@ -2263,7 +2263,7 @@ def auto_add_to_matrix(client, matrix, missing_dogs, schedule_data):
         new_loc = [new_coords["lng"], new_coords["lat"]]
         new_to_existing = {}
         existing_to_new = {}
-        batch_size = 45
+        batch_size = 500
 
         # Only compute ORS distances to dogs within 10 miles (haversine pre-filter)
         import math
