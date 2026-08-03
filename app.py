@@ -2467,6 +2467,47 @@ def main():
             "stop ORDER is planned from their home address, but the route sheet "
             "shows the temporary address so drivers go to the right place."
         )
+        if st.button(f"➕ Add {len(_temp_missing)} temp address ID(s) to matrix now"):
+            import requests as _rq
+            _ors_key = st.secrets.get("ors_api_key", "")
+            _addr_by_temp = {}
+            for _tr in _temp_rows[1:]:
+                _t2 = _tr[2].strip() if len(_tr) > 2 else ""
+                _a2 = _tr[3].strip() if len(_tr) > 3 else ""
+                if _t2 and _a2 and _t2 not in _addr_by_temp:
+                    _addr_by_temp[_t2] = _a2
+            _geo, _fail = {}, []
+            for _tid in sorted(set(_temp_missing.values())):
+                _ad = _addr_by_temp.get(_tid, "")
+                _res = None
+                if _ad and _ors_key:
+                    try:
+                        _r = _rq.get(
+                            "https://api.openrouteservice.org/geocode/search",
+                            params={"api_key": _ors_key, "text": _ad,
+                                    "boundary.country": "US", "size": 1},
+                            timeout=15,
+                        )
+                        _f = _r.json().get("features", [])
+                        if _f:
+                            _lng, _lat = _f[0]["geometry"]["coordinates"]
+                            _res = (float(_lat), float(_lng))
+                    except Exception:
+                        _res = None
+                if _res:
+                    _geo[_tid] = {"lat": _res[0], "lng": _res[1]}
+                else:
+                    _fail.append(f"{_tid} ({_ad or 'no address in TempAddresses col D'})")
+            if _geo:
+                matrix = auto_add_to_matrix(client, matrix, _geo, schedule_data)
+                st.success(
+                    f"➕ Added {len(_geo)} temp ID(s) to the matrix — reloading with "
+                    f"real distances..."
+                )
+                st.cache_data.clear()
+                st.rerun()
+            if _fail:
+                st.error("Couldn't geocode (check TempAddresses col D): " + ", ".join(_fail))
     _temp_redirect = {o: t for o, (t, _a, _l, _m) in _active_temps.items()
                       if t in matrix and _m == "both"}
     if _temp_redirect:
