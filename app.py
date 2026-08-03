@@ -228,23 +228,37 @@ def get_active_temps(temp_rows, route_date):
     whose date window covers route_date. A row needs both IDs, an address, and at
     least one date; blank start = active through end, blank end = active from
     start onward. Rows with BOTH dates blank are ignored (never auto-active)."""
-    active, problems = {}, []
+    active, name_ov, problems = {}, {}, []
     if not route_date:
-        return active, problems
+        return active, name_ov, problems
     # Layout: A=Customer Name (human label/lookup), B=original ID, C=temp ID,
-    # D=temp address, E=start date, F=end date
+    # D=temp address, E=start date, F=end date, G=label, H=direction,
+    # I=temp DOG NAME (replaces the dog's name for the window; row may be
+    # name-only — no temp ID/address needed)
     for row in temp_rows[1:]:  # skip header
         orig = row[1].strip() if len(row) > 1 else ""
         temp = row[2].strip() if len(row) > 2 else ""
         addr = row[3].strip() if len(row) > 3 else ""
-        if not orig and not temp and not addr:
+        new_name = row[8].strip() if len(row) > 8 else ""
+        if not orig and not temp and not addr and not new_name:
             continue  # blank row
         start = parse_any_date(row[4] if len(row) > 4 else "")
         end = parse_any_date(row[5] if len(row) > 5 else "")
-        if not orig or not temp or not addr or temp == orig or (start is None and end is None):
+        has_addr = bool(temp and addr and temp != orig)
+        if not orig or (start is None and end is None) or (not has_addr and not new_name):
             problems.append(f"row for '{orig or temp or addr[:20]}' is incomplete")
             continue
+        if (temp or addr) and not has_addr:
+            problems.append(f"{orig}: temp-ADDRESS part incomplete (needs both temp ID and "
+                            f"address) — the name change still applies")
         if (start is None or start <= route_date) and (end is None or route_date <= end):
+            if new_name:
+                if orig in name_ov:
+                    problems.append(f"{orig} has overlapping temp names — using the first")
+                else:
+                    name_ov[orig] = new_name
+            if not has_addr:
+                continue
             if orig in active:
                 problems.append(f"{orig} has overlapping temp addresses — using the first")
                 continue
@@ -260,7 +274,7 @@ def get_active_temps(temp_rows, route_date):
                 problems.append(f"{orig}: direction '{_m}' in col H not recognized — using both")
                 mode = "both"
             active[orig] = (temp, addr, label, mode)
-    return active, problems
+    return active, name_ov, problems
 
 
 class _TempRowView:
@@ -371,6 +385,7 @@ def is_front_dog(name):
 
 
 _TEMP_NAME_LABELS = set()  # every label seen in TempAddresses col G this session
+_TEMP_NAME_OVERRIDES = set()  # every temp dog name seen in col I this session
 
 
 def strip_display_prefixes(name):
@@ -1092,7 +1107,8 @@ def write_results_to_sheet(client, sheet_name, new_results, optimized_drivers, s
         _base = strip_display_prefixes(dog_name)
         if (cid in custom_names and custom_names[cid] != ""
                 and _base and dog_name.endswith(_base)
-                and custom_names[cid] != _base):
+                and custom_names[cid] != _base
+                and custom_names[cid] not in _TEMP_NAME_OVERRIDES):
             _prefix = dog_name[: len(dog_name) - len(_base)]
             dog_name = _prefix + custom_names[cid]  # manual edit, row's own ◼ etc. kept
         if _bd_syms and r.get("Action", "") == "PICK UP":
@@ -1198,6 +1214,34 @@ def _surgical_compute(rows, matrix, driver_name, config, assignments, schedule_l
     sched_by_cid = {}
     for a in my_assignments:
         sched_by_cid.setdefault(a["customer_id"], []).append(a)
+
+    def _srg_td(c):
+        al = sched_by_cid.get(c)
+        return al[0].get("temp_dir") if al else None
+
+    def _srg_mid(c, role):
+        """Matrix id for cid c in the given role ('pickup'/'dropoff') under a
+        one-direction temp address; original cid otherwise."""
+        td = _srg_td(c)
+        if td and td.get("mid") and td["mode"] == role:
+            return td["mid"]
+        return c
+
+    def _srg_view(cids_roles):
+        rd = {}
+        for c, role in cids_roles:
+            m = _srg_mid(c, role)
+            if m != c:
+                rd[c] = m
+        return _TempMatrixView(matrix, rd) if rd else matrix
+
+    def _srg_decorate(row, c, role):
+        """Temp address + label on the row when the temp applies to this role."""
+        td = _srg_td(c)
+        if td and td["mode"] == role:
+            row[3] = td["addr"]
+            row[2] = td["label"] + " " + row[2]
+        return row
 
     if target_cid is not None and target_cid not in sched_by_cid:
         _staff_hit = [a for a in assignments
@@ -1421,7 +1465,7 @@ def _surgical_compute(rows, matrix, driver_name, config, assignments, schedule_l
             )
         start, loads = trip_loads(trip)
         seq_ids = [(rows[i][10] or "").strip() for i in idxs]
-        new_id = new_row[10]
+        new_id = _srg_mid(new_row[10], "pickup" if is_pickup else "dropoff")
 
         # FRNT front-seat check: only one front seat. For a FRNT pickup, the
         # slot is valid only if no FRNT dog is (or will be) on board from that
@@ -1559,10 +1603,11 @@ def _surgical_compute(rows, matrix, driver_name, config, assignments, schedule_l
                 # this row is the dog's DROP OFF — give it the drop symbol
                 if not r[2].startswith("\u25fc"):
                     r[2] = "\u25fc" + r[2]
-                return r
+                return _srg_decorate(r, c, "dropoff")
             return row_by_cid[c]
+        _lm = _srg_view([(c, "dropoff") for c, _ in drops] + [(c, "pickup") for c, _ in picks])
         if is_final and not picks:
-            res = solve_simple_trip(matrix, [c for c, _ in drops],
+            res = solve_simple_trip(_lm, [c for c, _ in drops],
                                     config["field_id"], config["parking_id"])
             if res is None:
                 raise ValueError(f"Couldn't re-solve {driver_name}{td} — run a full re-optimization.")
@@ -1571,14 +1616,14 @@ def _surgical_compute(rows, matrix, driver_name, config, assignments, schedule_l
         else:
             res = None
             for _cap in (max(capacity, load), max(capacity + 4, load), load + 99):
-                res = solve_interleaved_trip(matrix, drops, picks, config["field_id"],
+                res = solve_interleaved_trip(_lm, drops, picks, config["field_id"],
                                              config["field_id"], _cap, load, **_front_kw)
                 if res is not None:
                     break
             if res is None and _front_kw:
                 # Never let the front-seat rule kill a route: drop it, note it
                 for _cap in (max(capacity, load), max(capacity + 4, load), load + 99):
-                    res = solve_interleaved_trip(matrix, drops, picks, config["field_id"],
+                    res = solve_interleaved_trip(_lm, drops, picks, config["field_id"],
                                                  config["field_id"], _cap, load)
                     if res is not None:
                         report.append(
@@ -1611,7 +1656,7 @@ def _surgical_compute(rows, matrix, driver_name, config, assignments, schedule_l
                 f"{a['dog_name'] or cid} isn't in the distance matrix yet — wait for the "
                 f"matrix update (or run it manually), then try again."
             )
-        _prow = make_row(a, tp)
+        _prow = _srg_decorate(make_row(a, tp), cid, "pickup")
         if bday_syms:
             _cn = schedule_lookup.get(cid, {}).get("customer_name", "").strip().lower()
             _s = bday_syms.get(_cn, "")
@@ -2407,7 +2452,10 @@ def main():
         _g = _tr[6].strip() if len(_tr) > 6 else ""
         if _g:
             _TEMP_NAME_LABELS.add(_g.rstrip())
-    _active_temps, _temp_problems = get_active_temps(_temp_rows, _route_d)
+        _nv = _tr[8].strip() if len(_tr) > 8 else ""
+        if _nv:
+            _TEMP_NAME_OVERRIDES.add(_nv)
+    _active_temps, _temp_name_ov, _temp_problems = get_active_temps(_temp_rows, _route_d)
     for _p in _temp_problems:
         st.warning(f"⚠️ TempAddresses: {_p}")
     _temp_missing = {o: t for o, (t, _a, _l, _m) in _active_temps.items() if t not in matrix}
@@ -2438,8 +2486,10 @@ def main():
         st.session_state.pop("errors", None)
 
     assignments = parse_schedule(schedule_data, date_col_idx)
-    if _active_temps:
+    if _active_temps or _temp_name_ov:
         for _a in assignments:
+            if _a["customer_id"] in _temp_name_ov:
+                _a["dog_name"] = _temp_name_ov[_a["customer_id"]]
             if _a["customer_id"] in _active_temps:
                 _t, _ad, _lbl, _m = _active_temps[_a["customer_id"]]
                 if _m == "both":
