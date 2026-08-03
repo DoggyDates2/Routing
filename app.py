@@ -224,13 +224,70 @@ def load_temp_addresses(_client, sheet_id):
 
 
 def get_active_temps(temp_rows, route_date):
-    """-> (active, problems). active: {orig_cid: (temp_cid, temp_addr)} for rows
-    whose date window covers route_date. A row needs both IDs, an address, and at
-    least one date; blank start = active through end, blank end = active from
-    start onward. Rows with BOTH dates blank are ignored (never auto-active)."""
+    """-> (active, name_ov, problems). TWO independent tables share the tab:
+    ADDRESS block A-H (B=orig ID, C=temp ID, D=temp address, E/F=dates,
+    G=label, H=direction) feeds active {orig: (temp, addr, label, mode)} —
+    these touch the MATRIX. NAME block I-L (I=dog ID, J=temp name, K/L=dates)
+    feeds name_ov {cid: temp_name} — display only, never touches the matrix.
+    Either block may be filled on any row; they're read separately. Blank
+    start = active through end; blank end = active from start; BOTH dates
+    blank = ignored (never auto-active)."""
     active, name_ov, problems = {}, {}, []
     if not route_date:
         return active, name_ov, problems
+    for row in temp_rows[1:]:  # skip header
+        # ── ADDRESS block (cols A-H) ──
+        orig = row[1].strip() if len(row) > 1 else ""
+        temp = row[2].strip() if len(row) > 2 else ""
+        addr = row[3].strip() if len(row) > 3 else ""
+        if orig or temp or addr:
+            start = parse_any_date(row[4] if len(row) > 4 else "")
+            end = parse_any_date(row[5] if len(row) > 5 else "")
+            if not orig or not temp or not addr or temp == orig or (start is None and end is None):
+                problems.append(f"address row for '{orig or temp or addr[:20]}' is incomplete")
+            elif (start is None or start <= route_date) and (end is None or route_date <= end):
+                if orig in active:
+                    problems.append(f"{orig} has overlapping temp addresses — using the first")
+                else:
+                    label = (row[6].strip() if len(row) > 6 else "") or "DIFF ADDRESS"
+                    _m = (row[7].strip().lower() if len(row) > 7 else "")
+                    if _m in ("", "both"):
+                        mode = "both"
+                    elif _m.startswith("pick") or _m.startswith("pu"):
+                        mode = "pickup"
+                    elif _m.startswith("drop") or _m.startswith("do"):
+                        mode = "dropoff"
+                    else:
+                        problems.append(f"{orig}: direction '{_m}' in col H not recognized — using both")
+                        mode = "both"
+                    active[orig] = (temp, addr, label, mode)
+        # ── NAME block (cols J-P; script reads L-P) — independent of addresses.
+        # J=customer picker, K=original name (both for humans, script ignores),
+        # L=dog's matrix/customer ID, M=new temp name (FULL replacement),
+        # N=start, O=end, P=pickup/drop/blank=both ──
+        n_cid = row[11].strip() if len(row) > 11 else ""
+        n_name = row[12].strip() if len(row) > 12 else ""
+        if n_cid or n_name:
+            n_start = parse_any_date(row[13] if len(row) > 13 else "")
+            n_end = parse_any_date(row[14] if len(row) > 14 else "")
+            if not n_cid or not n_name or (n_start is None and n_end is None):
+                problems.append(f"name row for '{n_cid or n_name[:20]}' is incomplete")
+            elif (n_start is None or n_start <= route_date) and (n_end is None or route_date <= n_end):
+                if n_cid in name_ov:
+                    problems.append(f"{n_cid} has overlapping temp names — using the first")
+                else:
+                    _pm = (row[15].strip().lower() if len(row) > 15 else "")
+                    if _pm in ("", "both"):
+                        n_mode = "both"
+                    elif _pm.startswith("pick") or _pm.startswith("pu"):
+                        n_mode = "pickup"
+                    elif _pm.startswith("drop") or _pm.startswith("do"):
+                        n_mode = "dropoff"
+                    else:
+                        problems.append(f"{n_cid}: direction '{_pm}' in col P not recognized — using both")
+                        n_mode = "both"
+                    name_ov[n_cid] = (n_name, n_mode)
+    return active, name_ov, problems
     # Layout: A=Customer Name (human label/lookup), B=original ID, C=temp ID,
     # D=temp address, E=start date, F=end date, G=label, H=direction,
     # I=temp DOG NAME (replaces the dog's name for the window; row may be
@@ -608,14 +665,30 @@ def solve_driver(matrix, driver_name, config, dogs, schedule_lookup):
         return _TempMatrixView(matrix, rd) if rd else matrix
 
     def _apply_dir_temp_display(rows_out):
-        """Temp address + label only on the matching action's rows; the other
-        leg keeps the home address. Covers all paths incl. forced safety rows."""
+        """Per-action temp decorations: address+label for one-direction temp
+        ADDRESSES, and base-name replacement for one-direction temp NAMES
+        (row decorations like ◼/2️⃣/🎂 are kept). Covers all paths incl.
+        forced safety rows."""
         for r in rows_out:
             d = dog_lookup.get(r.get("Customer ID"), {})
-            td = d.get("temp_dir") if isinstance(d, dict) else None
+            if not isinstance(d, dict):
+                continue
+            _act = r.get("Action")
+            tn = d.get("temp_name_dir")
+            if tn and (
+                (tn["mode"] == "pickup" and _act == "PICK UP")
+                or (tn["mode"] == "dropoff" and _act == "DROP OFF")
+            ):
+                _cur = r.get("Dog Name") or ""
+                _b = strip_display_prefixes(_cur)
+                if _b and _cur.endswith(_b):
+                    r["Dog Name"] = _cur[: len(_cur) - len(_b)] + tn["name"]
+                else:
+                    r["Dog Name"] = tn["name"]
+            td = d.get("temp_dir")
             if td and (
-                (td["mode"] == "pickup" and r.get("Action") == "PICK UP")
-                or (td["mode"] == "dropoff" and r.get("Action") == "DROP OFF")
+                (td["mode"] == "pickup" and _act == "PICK UP")
+                or (td["mode"] == "dropoff" and _act == "DROP OFF")
             ):
                 r["Address"] = td["addr"]
                 r["Dog Name"] = td["label"] + " " + (r.get("Dog Name") or "")
@@ -1236,7 +1309,16 @@ def _surgical_compute(rows, matrix, driver_name, config, assignments, schedule_l
         return _TempMatrixView(matrix, rd) if rd else matrix
 
     def _srg_decorate(row, c, role):
-        """Temp address + label on the row when the temp applies to this role."""
+        """Temp address + label, and/or temp NAME, when they apply to this role."""
+        al = sched_by_cid.get(c)
+        tn = al[0].get("temp_name_dir") if al else None
+        if tn and tn["mode"] == role:
+            _cur = row[2]
+            _b = strip_display_prefixes(_cur)
+            if _b and _cur.endswith(_b):
+                row[2] = _cur[: len(_cur) - len(_b)] + tn["name"]
+            else:
+                row[2] = tn["name"]
         td = _srg_td(c)
         if td and td["mode"] == role:
             row[3] = td["addr"]
@@ -2452,7 +2534,7 @@ def main():
         _g = _tr[6].strip() if len(_tr) > 6 else ""
         if _g:
             _TEMP_NAME_LABELS.add(_g.rstrip())
-        _nv = _tr[8].strip() if len(_tr) > 8 else ""
+        _nv = _tr[12].strip() if len(_tr) > 12 else ""
         if _nv:
             _TEMP_NAME_OVERRIDES.add(_nv)
     _active_temps, _temp_name_ov, _temp_problems = get_active_temps(_temp_rows, _route_d)
@@ -2530,7 +2612,11 @@ def main():
     if _active_temps or _temp_name_ov:
         for _a in assignments:
             if _a["customer_id"] in _temp_name_ov:
-                _a["dog_name"] = _temp_name_ov[_a["customer_id"]]
+                _tnm, _tnmode = _temp_name_ov[_a["customer_id"]]
+                if _tnmode == "both":
+                    _a["dog_name"] = _tnm
+                else:
+                    _a["temp_name_dir"] = {"mode": _tnmode, "name": _tnm}
             if _a["customer_id"] in _active_temps:
                 _t, _ad, _lbl, _m = _active_temps[_a["customer_id"]]
                 if _m == "both":
