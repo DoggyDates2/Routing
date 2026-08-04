@@ -442,7 +442,8 @@ def is_front_dog(name):
 
 
 _TEMP_NAME_LABELS = set()  # every label seen in TempAddresses col G this session
-_TEMP_NAME_OVERRIDES = set()  # every temp dog name seen in col I this session
+_TEMP_NAME_OVERRIDES = set()  # every temp dog name seen on the tab this session
+_TEMP_NAME_ACTIVE_CIDS = set()  # cids whose temp name is active for the selected date
 
 
 def strip_display_prefixes(name):
@@ -1135,16 +1136,10 @@ def write_results_to_sheet(client, sheet_name, new_results, optimized_drivers, s
         if same_date and _hdr_ok:
             # Same date — check for manual name edits and merge
             for row in existing_data[2:]:  # skip date row and header
-                if len(row) > 10 and row[10]:
-                    cid = row[10].strip()
-                    # Anchor rows (fields/parking) must never override each other's
-                    # labels; and strip display decorations (◼/2️⃣/3️⃣/birthday) so a
-                    # drop-off row's "◼Chico" can't get stamped onto pickup rows.
-                    if cid and ANCHOR_ID_RE.match(cid):
-                        continue
-                    existing_name = strip_display_prefixes(row[2].strip()) if len(row) > 2 else ""
-                    if cid and existing_name:
-                        custom_names[cid] = existing_name
+                # Manual-name preservation REMOVED (Aug 4): the Routes page is
+                # output-only. Permanent renames -> Schedule column B; temporary
+                # renames -> TempAddresses cols L-P. (The old harvest guessed
+                # whether a sheet name was a manual edit and kept guessing wrong.)
 
                 # Merge: ALWAYS keep rows for drivers NOT being re-optimized,
                 # no matter how many drivers this run covers.
@@ -1177,13 +1172,6 @@ def write_results_to_sheet(client, sheet_name, new_results, optimized_drivers, s
         cid = r.get("Customer ID", "")
         
         dog_name = r.get("Dog Name", "")
-        _base = strip_display_prefixes(dog_name)
-        if (cid in custom_names and custom_names[cid] != ""
-                and _base and dog_name.endswith(_base)
-                and custom_names[cid] != _base
-                and custom_names[cid] not in _TEMP_NAME_OVERRIDES):
-            _prefix = dog_name[: len(dog_name) - len(_base)]
-            dog_name = _prefix + custom_names[cid]  # manual edit, row's own ◼ etc. kept
         if _bd_syms and r.get("Action", "") == "PICK UP":
             _s = _bd_syms.get(r.get("Customer Name", "").strip().lower(), "")
             if _s:
@@ -2542,6 +2530,8 @@ def main():
         if _nv:
             _TEMP_NAME_OVERRIDES.add(_nv)
     _active_temps, _temp_name_ov, _temp_problems = get_active_temps(_temp_rows, _route_d)
+    _TEMP_NAME_ACTIVE_CIDS.clear()
+    _TEMP_NAME_ACTIVE_CIDS.update(_temp_name_ov.keys())
     if _temp_name_ov:
         _nm_list = ", ".join(f"{_k}\u2192{_v[0]}" for _k, _v in list(_temp_name_ov.items())[:4])
         st.sidebar.caption(f"\U0001F4DB Temp names active for {selected_date}: {len(_temp_name_ov)} ({_nm_list})")
