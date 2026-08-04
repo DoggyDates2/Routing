@@ -266,7 +266,7 @@ def get_active_temps(temp_rows, route_date):
     active, name_ov, problems = {}, {}, []
     if not route_date:
         return active, name_ov, problems
-    for row in temp_rows[1:]:  # skip header
+    for row in temp_rows[2:]:  # row 1 = headers, row 2 = notes; data starts row 3
         # ── ADDRESS block (cols A-H) ──
         orig = row[1].strip() if len(row) > 1 else ""
         temp = row[2].strip() if len(row) > 2 else ""
@@ -318,50 +318,6 @@ def get_active_temps(temp_rows, route_date):
                         problems.append(f"{n_cid}: direction '{_pm}' in col P not recognized — using both")
                         n_mode = "both"
                     name_ov[n_cid] = (n_name, n_mode)
-    return active, name_ov, problems
-    # Layout: A=Customer Name (human label/lookup), B=original ID, C=temp ID,
-    # D=temp address, E=start date, F=end date, G=label, H=direction,
-    # I=temp DOG NAME (replaces the dog's name for the window; row may be
-    # name-only — no temp ID/address needed)
-    for row in temp_rows[1:]:  # skip header
-        orig = row[1].strip() if len(row) > 1 else ""
-        temp = row[2].strip() if len(row) > 2 else ""
-        addr = row[3].strip() if len(row) > 3 else ""
-        new_name = row[8].strip() if len(row) > 8 else ""
-        if not orig and not temp and not addr and not new_name:
-            continue  # blank row
-        start = parse_any_date(row[4] if len(row) > 4 else "")
-        end = parse_any_date(row[5] if len(row) > 5 else "")
-        has_addr = bool(temp and addr and temp != orig)
-        if not orig or (start is None and end is None) or (not has_addr and not new_name):
-            problems.append(f"row for '{orig or temp or addr[:20]}' is incomplete")
-            continue
-        if (temp or addr) and not has_addr:
-            problems.append(f"{orig}: temp-ADDRESS part incomplete (needs both temp ID and "
-                            f"address) — the name change still applies")
-        if (start is None or start <= route_date) and (end is None or route_date <= end):
-            if new_name:
-                if orig in name_ov:
-                    problems.append(f"{orig} has overlapping temp names — using the first")
-                else:
-                    name_ov[orig] = new_name
-            if not has_addr:
-                continue
-            if orig in active:
-                problems.append(f"{orig} has overlapping temp addresses — using the first")
-                continue
-            label = (row[6].strip() if len(row) > 6 else "") or "DIFF ADDRESS"
-            _m = (row[7].strip().lower() if len(row) > 7 else "")
-            if _m in ("", "both"):
-                mode = "both"
-            elif _m.startswith("pick") or _m.startswith("pu"):
-                mode = "pickup"
-            elif _m.startswith("drop") or _m.startswith("do"):
-                mode = "dropoff"
-            else:
-                problems.append(f"{orig}: direction '{_m}' in col H not recognized — using both")
-                mode = "both"
-            active[orig] = (temp, addr, label, mode)
     return active, name_ov, problems
 
 
@@ -2557,7 +2513,7 @@ def main():
     # ── Temporary pickup addresses (TempAddresses tab) ──
     _temp_rows = load_temp_addresses(client, schedule_sheet_id)
     _route_d = parse_route_date(selected_date)
-    for _tr in _temp_rows[1:]:
+    for _tr in _temp_rows[2:]:
         _g = _tr[6].strip() if len(_tr) > 6 else ""
         if _g:
             _TEMP_NAME_LABELS.add(_g.rstrip())
@@ -2570,7 +2526,7 @@ def main():
     if _temp_name_ov:
         _nm_list = ", ".join(f"{_k}\u2192{_v[0]}" for _k, _v in list(_temp_name_ov.items())[:4])
         st.sidebar.caption(f"\U0001F4DB Temp names active for {selected_date}: {len(_temp_name_ov)} ({_nm_list})")
-    elif any((len(_tr) > 12 and _tr[12].strip()) for _tr in _temp_rows[1:]):
+    elif any((len(_tr) > 12 and _tr[12].strip()) for _tr in _temp_rows[2:]):
         st.sidebar.caption(f"\U0001F4DB Temp names: 0 active for {selected_date} (rows exist but none match this date \u2014 check cols L\u2013O)")
     for _p in _temp_problems:
         st.warning(f"⚠️ TempAddresses: {_p}")
@@ -2587,7 +2543,7 @@ def main():
             import requests as _rq
             _ors_key = st.secrets.get("ors_api_key", "")
             _addr_by_temp = {}
-            for _tr in _temp_rows[1:]:
+            for _tr in _temp_rows[2:]:
                 _t2 = _tr[2].strip() if len(_tr) > 2 else ""
                 _a2 = _tr[3].strip() if len(_tr) > 3 else ""
                 if _t2 and _a2 and _t2 not in _addr_by_temp:
