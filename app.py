@@ -2156,6 +2156,10 @@ def purge_dogs_from_matrix(client, purge_ids):
 
 
 def auto_add_to_matrix(client, matrix, missing_dogs, schedule_data):
+    # If temp addresses are active, `matrix` is a read-only _TempMatrixView —
+    # unwrap to the real dict so the new dog's rows can be written.
+    if isinstance(matrix, _TempMatrixView):
+        matrix = matrix._m
     """Automatically add missing dogs to the matrix using ORS API."""
     import requests
     import time as _time
@@ -2263,7 +2267,7 @@ def auto_add_to_matrix(client, matrix, missing_dogs, schedule_data):
         new_loc = [new_coords["lng"], new_coords["lat"]]
         new_to_existing = {}
         existing_to_new = {}
-        batch_size = 500
+        batch_size = 45
 
         # Only compute ORS distances to dogs within 10 miles (haversine pre-filter)
         import math
@@ -2783,6 +2787,8 @@ def main():
         if st.button(f"➕ Add {len(missing_dogs)} dog(s) to matrix now", type="secondary"):
             matrix = auto_add_to_matrix(client, matrix, missing_dogs, schedule_data)
             all_matrix_ids = set(matrix.keys())
+            st.cache_data.clear()
+            st.rerun()  # rebuild with the fresh matrix (and temp redirects re-applied)
 
     # ── Load snapshot and detect changes ──
     snapshot, snapshot_date = load_snapshot(client, SHEET_NAME)
