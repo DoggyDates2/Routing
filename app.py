@@ -2542,6 +2542,11 @@ def main():
         if _nv:
             _TEMP_NAME_OVERRIDES.add(_nv)
     _active_temps, _temp_name_ov, _temp_problems = get_active_temps(_temp_rows, _route_d)
+    if _temp_name_ov:
+        _nm_list = ", ".join(f"{_k}\u2192{_v[0]}" for _k, _v in list(_temp_name_ov.items())[:4])
+        st.sidebar.caption(f"\U0001F4DB Temp names active for {selected_date}: {len(_temp_name_ov)} ({_nm_list})")
+    elif any((len(_tr) > 12 and _tr[12].strip()) for _tr in _temp_rows[1:]):
+        st.sidebar.caption(f"\U0001F4DB Temp names: 0 active for {selected_date} (rows exist but none match this date \u2014 check cols L\u2013O)")
     for _p in _temp_problems:
         st.warning(f"⚠️ TempAddresses: {_p}")
     _temp_missing = {o: t for o, (t, _a, _l, _m) in _active_temps.items() if t not in matrix}
