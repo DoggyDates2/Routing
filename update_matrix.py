@@ -368,7 +368,7 @@ def add_dogs_to_matrix(creds, matrix, missing_dogs, schedule_data, file_id, matr
         new_loc = [new_coords["lng"], new_coords["lat"]]
         new_to_existing = {}
         existing_to_new = {}
-        batch_size = 500
+        batch_size = 45  # ORS free tier caps ~50 locations per request
 
         # Haversine pre-filter: only compute ORS for nearby dogs + all fields/parking
         import math
@@ -633,10 +633,10 @@ def repair_9999s(creds, matrix, schedule_data, file_id, matrix_text, ors_key):
 
     def _fill_from_source(src_id, dest_ids):
         filled = 0
-        for k in range(0, len(dest_ids), 500):
+        for k in range(0, len(dest_ids), 45):
             if _ORS_QUOTA_HIT["v"]:
                 return filled
-            chunk = dest_ids[k:k + 500]
+            chunk = dest_ids[k:k + 45]
             locations = [[coords_lookup[src_id]["lng"], coords_lookup[src_id]["lat"]]] + [
                 [coords_lookup[d]["lng"], coords_lookup[d]["lat"]] for d in chunk
             ]
