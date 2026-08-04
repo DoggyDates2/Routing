@@ -2664,6 +2664,14 @@ def main():
 
     scheduled_names = sorted(set(a["driver"] for a in assignments if a.get("driver")))
     st.sidebar.markdown(f"**Drivers on schedule:** {len(scheduled_names)}")
+    try:
+        _osid = (st.secrets.get("output_sheet_id", "") or "").strip()
+    except Exception:
+        _osid = ""
+    if _osid:
+        st.sidebar.caption(f"🗂 Routes write to: custom sheet (…{_osid[-6:]}) / {_routes_tab_name()}")
+    else:
+        st.sidebar.caption(f"🗂 Routes write to: Routing sheet / {OUTPUT_TAB_NAME}")
     _bd = load_birthdays(client, SHEET_NAME)
     if _bd is None:
         st.sidebar.warning("🎂 Birthdays tab NOT FOUND (checked Routing + Schedule spreadsheets)")
