@@ -25,6 +25,37 @@ SCOPES = [
 SHEET_NAME = st.secrets.get("sheet_name", "Routing")
 MATRIX_FILE_NAME = st.secrets.get("matrix_file_name", "matrix.csv")
 OUTPUT_TAB_NAME = "Optimized Routes"
+
+
+def _swap_bk(row):
+    """Sheet column order swap: internally rows are [..., Stop@1, ..., Customer ID@10];
+    on the SHEET those two columns trade places (Customer ID in B, Stop in K).
+    Involution — the same swap converts both directions."""
+    r = list(row)
+    if len(r) > 10:
+        r[1], r[10] = r[10], r[1]
+    return r
+
+
+def _routes_tab_name():
+    """Output tab name — override with the output_tab_name secret (e.g. "Main Page")."""
+    try:
+        return (st.secrets.get("output_tab_name", "") or "").strip() or OUTPUT_TAB_NAME
+    except Exception:
+        return OUTPUT_TAB_NAME
+
+
+def _open_output_sheet(client, default_sheet_name):
+    """Spreadsheet that receives the optimized routes. Set the output_sheet_id
+    secret to send routes to a different spreadsheet (share it with the service
+    account as Editor). REMOVE the secret to switch back — no code change."""
+    try:
+        _sid = (st.secrets.get("output_sheet_id", "") or "").strip()
+    except Exception:
+        _sid = ""
+    if _sid:
+        return client.open_by_key(_sid)
+    return client.open(default_sheet_name)
 SNAPSHOT_TAB_NAME = "Route Snapshot"
 
 
@@ -1105,7 +1136,7 @@ def solve_driver(matrix, driver_name, config, dogs, schedule_lookup):
 
 def write_results_to_sheet(client, sheet_name, new_results, optimized_drivers, selected_date, ride_alongs=None):
     """Write routes to sheet with date tracking."""
-    sheet = client.open(sheet_name)
+    sheet = _open_output_sheet(client, sheet_name)
     
     header = ["Assignment", "Stop", "Dog Name", "Address", "Phone",
               "Customer Name", "Instructions", "Dog Breed", "House Description",
@@ -1115,7 +1146,7 @@ def write_results_to_sheet(client, sheet_name, new_results, optimized_drivers, s
     existing_rows = []
     custom_names = {}
     try:
-        existing_ws = sheet.worksheet(OUTPUT_TAB_NAME)
+        existing_ws = sheet.worksheet(_routes_tab_name())
         existing_data = existing_ws.get_all_values()
         
         # Check if existing data is from the same date
@@ -1132,7 +1163,7 @@ def write_results_to_sheet(client, sheet_name, new_results, optimized_drivers, s
         # label change never silently disables merging and wipes other drivers.
         _hdr_ok = (len(_row2) == len(header)
                    and _row2 and _row2[0] == header[0]
-                   and _row2[-1] == header[-1])
+                   and _row2[-1] == _swap_bk(header)[-1])
         if same_date and _hdr_ok:
             # Same date — check for manual name edits and merge
             for row in existing_data[2:]:  # skip date row and header
@@ -1146,15 +1177,14 @@ def write_results_to_sheet(client, sheet_name, new_results, optimized_drivers, s
                 if len(row) > 0 and ":" in row[0]:
                     row_driver = row[0].split(":")[0]
                     if row_driver not in optimized_drivers:
-                        existing_rows.append(row)
+                        existing_rows.append(_swap_bk(row))
                 elif len(row) > 9 and row[9]:
                     import re as _re
                     driver_match = _re.match(r'([A-Za-z]+)', row[9])
                     if driver_match and driver_match.group(1) not in optimized_drivers:
-                        existing_rows.append(row)
+                        existing_rows.append(_swap_bk(row))
         # Different date or no header match — full rewrite, no merge
         
-        sheet.del_worksheet(existing_ws)
     except gspread.exceptions.WorksheetNotFound:
         pass
 
@@ -1199,17 +1229,22 @@ def write_results_to_sheet(client, sheet_name, new_results, optimized_drivers, s
     checklist_rows = build_driver_checklist(rows_to_checklist_results(all_rows), ride_alongs)
     
     max_rows = max(len(all_rows), len(checklist_rows)) + 2  # +2 for date row and header
-    ws = sheet.add_worksheet(title=OUTPUT_TAB_NAME, rows=max_rows, cols=15)
+    try:
+        ws = sheet.worksheet(_routes_tab_name())
+        ws.clear()  # refill in place — the tab keeps its identity/links
+        ws.resize(rows=max_rows, cols=15)
+    except gspread.exceptions.WorksheetNotFound:
+        ws = sheet.add_worksheet(title=_routes_tab_name(), rows=max_rows, cols=15)
     
     # Row 1: Date
     ws.update(range_name="A1", values=[[selected_date]])
     
     # Row 2: Header
-    ws.update(range_name="A2", values=[header])
+    ws.update(range_name="A2", values=[_swap_bk(header)])
     
     # Row 3+: Data
     if all_rows:
-        ws.update(range_name="A3", values=all_rows)
+        ws.update(range_name="A3", values=[_swap_bk(r) for r in all_rows])
 
     # Checklist header and data (columns M-O)
     checklist_header = ["Dog", "Trip", "Driver"]
@@ -1776,15 +1811,15 @@ def surgical_apply(client, sheet_name, matrix, driver_name, config, assignments,
             f"anchors, so surgical changes can't work. Fill in their Staff row, "
             f"then run a full optimization for them."
         )
-    sheet = client.open(sheet_name)
+    sheet = _open_output_sheet(client, sheet_name)
     try:
-        ws = sheet.worksheet(OUTPUT_TAB_NAME)
+        ws = sheet.worksheet(_routes_tab_name())
     except gspread.exceptions.WorksheetNotFound:
         raise ValueError("No Routes tab found — run a full optimization first.")
     data = ws.get_all_values()
     if not data or not data[0] or (data[0][0] or "").strip() != selected_date:
         raise ValueError("The Routes tab is for a different date — run a full optimization first.")
-    rows = [list(r) + [""] * (11 - len(r)) for r in data[2:]]
+    rows = [_swap_bk(list(r) + [""] * (11 - len(r))) for r in data[2:]]
 
     try:
         _bd_syms = birthday_symbols(load_birthdays(client, sheet_name),
@@ -1812,12 +1847,12 @@ def surgical_apply(client, sheet_name, matrix, driver_name, config, assignments,
         _r[1] = _seq[_t]
 
     max_rows = max(len(final_rows), len(checklist_rows)) + 2
-    sheet.del_worksheet(ws)
-    ws = sheet.add_worksheet(title=OUTPUT_TAB_NAME, rows=max_rows, cols=15)
+    ws.clear()
+    ws.resize(rows=max_rows, cols=15)
     ws.update(range_name="A1", values=[[selected_date]])
-    ws.update(range_name="A2", values=[header])
+    ws.update(range_name="A2", values=[_swap_bk(header)])
     if final_rows:
-        ws.update(range_name="A3", values=final_rows)
+        ws.update(range_name="A3", values=[_swap_bk(r) for r in final_rows])
     ws.update(range_name="M1", values=[[selected_date]])
     ws.update(range_name="M2", values=[["Dog", "Trip", "Driver"]])
     if checklist_rows:
@@ -2796,7 +2831,7 @@ def main():
     # is. Group-changes (same dog in both added and removed) are never auto-cleared.
     _routes_tab_date = None
     try:
-        _rt_ws = client.open(SHEET_NAME).worksheet(OUTPUT_TAB_NAME)
+        _rt_ws = _open_output_sheet(client, SHEET_NAME).worksheet(_routes_tab_name())
         _rt = _rt_ws.get_all_values()
         _routes_tab_date = (_rt[0][0] or "").strip() if _rt and _rt[0] else None
     except Exception:
@@ -2812,11 +2847,12 @@ def main():
             if _rt and _rt[0] and (_rt[0][0] or "").strip() == selected_date:
                 _sheet_cids = {}
                 for _r in _rt[2:]:
-                    if len(_r) > 10 and _r[10].strip() and not ANCHOR_ID_RE.match(_r[10].strip()):
+                    _rs = _swap_bk(_r)
+                    if len(_rs) > 10 and _rs[10].strip() and not ANCHOR_ID_RE.match(_rs[10].strip()):
                         _asn = (_r[0] or "").strip()
                         _d = _asn.split(":")[0].strip() if ":" in _asn else ""
                         if _d:
-                            _sheet_cids.setdefault(_d, set()).add(_r[10].strip())
+                            _sheet_cids.setdefault(_d, set()).add(_rs[10].strip())
                 for _drv in list(changes.keys()):
                     _have = _sheet_cids.get(_drv, set())
                     _added = changes[_drv].get("added", set())
