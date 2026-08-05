@@ -953,11 +953,15 @@ def solve_driver(matrix, driver_name, config, dogs, schedule_lookup):
                 _im, dropoffs, pickups, field, field, capacity, initial_load, **_front_kw
             )
 
-            # If capacity is too tight, retry with relaxed limit
+            # Over-assigned leg: relax capacity ONE seat at a time, so the route
+            # runs exactly as tight as physics requires and no tighter
             if result is None:
-                result = solve_interleaved_trip(
-                    _im, dropoffs, pickups, field, field, capacity + 4, initial_load, **_front_kw
-                )
+                for _extra in (1, 2, 3, 4):
+                    result = solve_interleaved_trip(
+                        _im, dropoffs, pickups, field, field, capacity + _extra, initial_load, **_front_kw
+                    )
+                    if result is not None:
+                        break
 
             # Never let the front-seat rule kill a route: drop it, warn, retry
             if result is None and _front_kw:
@@ -965,9 +969,12 @@ def solve_driver(matrix, driver_name, config, dogs, schedule_lookup):
                     _im, dropoffs, pickups, field, field, capacity, initial_load
                 )
                 if result is None:
-                    result = solve_interleaved_trip(
-                        _im, dropoffs, pickups, field, field, capacity + 4, initial_load
-                    )
+                    for _extra in (1, 2, 3, 4):
+                        result = solve_interleaved_trip(
+                            _im, dropoffs, pickups, field, field, capacity + _extra, initial_load
+                        )
+                        if result is not None:
+                            break
                 if result is not None:
                     _front_warn(f"couldn't order stops to keep only one FRNT dog up front "
                                 f"during groups {prev_group}→{next_group} — check this route by hand.")
