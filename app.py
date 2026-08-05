@@ -3063,14 +3063,18 @@ def main():
             dogs = [a for a in assignments if a["driver"] == name]
             driver_jobs.append((matrix, name, config, dogs, schedule_lookup))
 
-        # Solve in parallel
-        from concurrent.futures import ProcessPoolExecutor, as_completed
+        # Solve in parallel. THREADS, not processes: Streamlit re-executes the
+        # script on any interaction, which makes module functions unpicklable
+        # mid-run ("not the same object as __main__.solve_driver" on later
+        # drivers). Threads skip pickling entirely; OR-Tools solves in C++
+        # and releases the GIL, so thread parallelism is real.
+        from concurrent.futures import ThreadPoolExecutor, as_completed
         import multiprocessing
 
         n_workers = min(4, multiprocessing.cpu_count(), len(driver_jobs))
 
         completed = 0
-        with ProcessPoolExecutor(max_workers=n_workers) as executor:
+        with ThreadPoolExecutor(max_workers=n_workers) as executor:
             futures = {
                 executor.submit(solve_driver, *job): job[1]
                 for job in driver_jobs
