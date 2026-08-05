@@ -527,14 +527,23 @@ def parse_schedule(schedule_data, date_col_idx):
         driver_name = parts[0].strip()
         code = parts[1].strip() if len(parts) > 1 else ""
 
+        # "Missed:1" / "Missed:1&2" = we showed up but the dog wasn't there.
+        # The Schedule keeps the code so BILLING sees the attempted service,
+        # but the optimizer ignores the dog completely: no stops, no capacity,
+        # no driver warnings, no change-detection noise. (Any code after
+        # "Missed:" is for billing records only.)
+        if driver_name.lower() == "missed":
+            continue
+
         # "Trial" anywhere in the code (e.g. Jon:1Trial1) = trial dog — show 😎
         # in front of the name everywhere (routes, surgical, checklist).
         is_trial = "trial" in code.lower()
 
-        # "XX" in the code (e.g. 1XX23, upper or lower case) = ride-along dog:
-        # rides in the van all day, takes capacity, shows on the checklist,
-        # but gets NO pickup/dropoff stops in the route.
-        is_ride_along = "xx" in code.lower()
+        # "XX" with THREE OR MORE digits (e.g. 1XX23) = ride-along dog: rides
+        # in the van, takes capacity, shows on the checklist, NO route stops.
+        # "XX" with exactly TWO digits (1XX1, 1XX3, 2XX2) = normally ROUTED
+        # dog (pickup first digit, drop last digit, span capacity as usual).
+        is_ride_along = "xx" in code.lower() and len(re.findall(r"\d", code)) >= 3
 
         # Handle "!" split — dog goes home between groups (e.g., "1!3" = group 1, then group 3 separately)
         if "!" in code:
@@ -2591,8 +2600,7 @@ def main():
                       if t in matrix and _m == "both"}
     if _temp_redirect:
         matrix = _TempMatrixView(matrix, _temp_redirect)
-        st.info("📍 Temporary addresses active today: "
-                + ", ".join(f"{o} → {t}" for o, t in sorted(_temp_redirect.items())))
+        # working temps are silent by design — only problems get surfaced
 
     date_col_idx = available_dates[selected_date]["col_idx"]
 
@@ -2860,6 +2868,10 @@ def main():
                 # If too many changes, just show summary
                 if len(changed_active) > 7 or total_changes > 30:
                     st.info(f"🔄 {len(changed_active)} driver(s) have changes since last optimization ({total_changes} total changes). Select All and re-optimize.")
+                elif total_changes <= 15:
+                    # The Surgical Add list below shows these same entries as
+                    # actionable checkboxes — don't render them twice.
+                    st.info(f"🔄 {len(changed_active)} driver(s) have changes since last optimization — see Surgical Add below.")
                 else:
                     # Build dog name lookup from schedule
                     dog_name_lookup = {}
