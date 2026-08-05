@@ -2556,25 +2556,31 @@ def main():
     #    A blank / non-date A1 means no date tracking — use Staff as always. ──
     _staff_a1 = parse_any_date(staff_data[0][0] if staff_data and staff_data[0] else "")
     _sel_d = parse_route_date(selected_date)
-    if _staff_a1 and _sel_d and _staff_a1 != _sel_d:
+    # Symmetric rule: whichever tab's A1 matches the selected date is the one
+    # that gets read. Staff matches → Staff. Otherwise (mismatched OR blank
+    # A1) check YESTERDAYSTAFF's A1; if IT matches, use it. Neither matches:
+    # warn if Staff carried a real conflicting date, stay silent if the tabs
+    # simply aren't date-tracked.
+    if _sel_d and _staff_a1 != _sel_d:
         _y_data = None
         try:
             _y_data = client.open(SHEET_NAME).worksheet("YESTERDAYSTAFF").get_all_values()
         except Exception:
             _y_data = None
         _y_a1 = parse_any_date(_y_data[0][0] if _y_data and _y_data[0] else "")
+        _s_txt = _staff_a1.strftime('%A %B %-d') if _staff_a1 else "no date in A1"
         if _y_data and _y_a1 == _sel_d:
             staff_data = _y_data
             drivers = parse_staff(staff_data)
-            st.info(f"ℹ️ Staff tab is dated {_staff_a1.strftime('%A %B %-d')} — using the "
-                    f"YESTERDAYSTAFF tab for {selected_date}.")
-        elif _y_data is None:
-            st.warning(f"⚠️ Staff tab A1 is dated {_staff_a1.strftime('%A %B %-d')}, not "
+            st.info(f"ℹ️ Staff tab has {_s_txt} — using the YESTERDAYSTAFF tab "
+                    f"(dated {selected_date}).")
+        elif _staff_a1 and _y_data is None:
+            st.warning(f"⚠️ Staff tab A1 is dated {_s_txt}, not "
                        f"{selected_date}, and no YESTERDAYSTAFF tab was found — using the "
                        f"Staff tab anyway. Double-check driver info.")
-        else:
+        elif _staff_a1:
             _y_txt = _y_a1.strftime('%A %B %-d') if _y_a1 else "no date in A1"
-            st.warning(f"⚠️ Neither Staff ({_staff_a1.strftime('%A %B %-d')}) nor "
+            st.warning(f"⚠️ Neither Staff ({_s_txt}) nor "
                        f"YESTERDAYSTAFF ({_y_txt}) matches {selected_date} — using the "
                        f"Staff tab anyway. Double-check driver info.")
     # ── Temporary pickup addresses (TempAddresses tab) ──
