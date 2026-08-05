@@ -2427,12 +2427,12 @@ def main():
         div[data-testid="column"] { padding: 0 0.25rem; }
         div[data-testid="stVerticalBlock"] { gap: 0.45rem; }
         /* the date picker IS the page header — big, bold, one line */
-        div[data-testid="stSelectbox"] div[data-baseweb="select"] > div { font-size: 1.4rem; font-weight: 700; }
+        div[data-testid="stSelectbox"] div[data-baseweb="select"] > div { font-size: 1.85rem; font-weight: 800; }
         </style>
     """, unsafe_allow_html=True)
 
     # Header row: Refresh | date | prep toggle — one line
-    _hdr_l, _hdr_m, _hdr_r = st.columns([1.1, 3.6, 1.0], vertical_alignment="center")
+    _hdr_l, _hdr_m, _hdr_r, _hdr_sp = st.columns([1.1, 2.1, 0.9, 1.9], vertical_alignment="center")
     with _hdr_l:
         if st.button("🔄 Refresh Data", help="Reload latest data from Google Sheets"):
             st.cache_data.clear()
@@ -3039,7 +3039,7 @@ def main():
                 use_container_width=True,
             )
         else:
-            st.caption("☝ pick at least one driver")
+            pass
             optimize_btn = False
 
     if optimize_btn:
