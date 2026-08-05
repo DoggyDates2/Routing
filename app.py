@@ -2412,7 +2412,6 @@ def auto_add_to_matrix(client, matrix, missing_dogs, schedule_data):
 def main():
     st.set_page_config(page_title="Doggy Dates Route Optimizer", page_icon="🐕", layout="wide")
 
-    st.markdown("<h1 style='color: green;'>Doggy Dates Route Optimizer</h1>", unsafe_allow_html=True)
     st.markdown("""
         <style>
         /* tighten vertical rhythm of checkboxes (driver grid + surgical list) */
@@ -2421,6 +2420,8 @@ def main():
         /* slim the gaps between grid columns and stacked blocks */
         div[data-testid="column"] { padding: 0 0.25rem; }
         div[data-testid="stVerticalBlock"] { gap: 0.45rem; }
+        /* the date picker IS the page header — big, bold, one line */
+        div[data-testid="stSelectbox"] div[data-baseweb="select"] > div { font-size: 1.4rem; font-weight: 700; }
         </style>
     """, unsafe_allow_html=True)
 
@@ -2504,7 +2505,8 @@ def main():
         if _want is not None:
             _match = next((l for l in _date_labels if parse_route_date(l) == _want), None)
         st.session_state["date_select"] = _match or _date_labels[_default_idx]
-    selected_date = st.selectbox("Select date:", _date_labels, key="date_select")
+    selected_date = st.selectbox("Select date:", _date_labels, key="date_select",
+                                 label_visibility="collapsed")
     try:
         st.query_params["d"] = selected_date  # pin the pick so reboots keep it
     except Exception:
@@ -2865,7 +2867,6 @@ def main():
             pass  # reconciliation is best-effort; never block the app on it
 
     # ── Driver checklist ──
-    st.subheader("Select Drivers to Optimize")
 
     if changes is not None:
         changed_drivers = set(changes.keys())
@@ -3018,7 +3019,7 @@ def main():
                 use_container_width=True,
             )
         else:
-            st.write("Select at least one driver to optimize.")
+            st.caption("☝ pick at least one driver")
             optimize_btn = False
 
     if optimize_btn:
@@ -3240,12 +3241,6 @@ def main():
     # ── Surgical Add ──
     st.divider()
     st.subheader("🔧 Surgical Add")
-    st.caption(
-        "Apply pending Schedule changes without reshuffling routes in progress. "
-        "Check the changes to apply: pickups get inserted at the cheapest capacity-safe spot "
-        "(no other pickups move); drop-off trips are re-optimized since they haven't started. "
-        "Use the main Optimize button when a full reshuffle is fine."
-    )
     _name_by_cid = {}
     for _row in schedule_data[1:]:
         _c = _row[6].strip() if len(_row) > 6 else ""
