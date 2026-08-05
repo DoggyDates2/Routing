@@ -2413,6 +2413,16 @@ def main():
     st.set_page_config(page_title="Doggy Dates Route Optimizer", page_icon="🐕", layout="wide")
 
     st.markdown("<h1 style='color: green;'>Doggy Dates Route Optimizer</h1>", unsafe_allow_html=True)
+    st.markdown("""
+        <style>
+        /* tighten vertical rhythm of checkboxes (driver grid + surgical list) */
+        div[data-testid="stCheckbox"] { margin-bottom: -1.1rem; }
+        div[data-testid="stCheckbox"] label p { font-size: 0.88rem; }
+        /* slim the gaps between grid columns and stacked blocks */
+        div[data-testid="column"] { padding: 0 0.25rem; }
+        div[data-testid="stVerticalBlock"] { gap: 0.45rem; }
+        </style>
+    """, unsafe_allow_html=True)
 
     # Refresh button to reload data from Sheets
     if st.button("🔄 Refresh Data", help="Reload latest data from Google Sheets"):
@@ -2965,7 +2975,7 @@ def main():
     selected_drivers = []
     
     # Grid layout — 4 columns
-    n_cols = 4
+    n_cols = 6
     driver_list = active_drivers_with_dogs
     rows_needed = (len(driver_list) + n_cols - 1) // n_cols
 
