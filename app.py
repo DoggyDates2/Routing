@@ -2431,14 +2431,16 @@ def main():
         </style>
     """, unsafe_allow_html=True)
 
-    # Refresh button to reload data from Sheets
-    if st.button("🔄 Refresh Data", help="Reload latest data from Google Sheets"):
-        st.cache_data.clear()
-        for key in list(st.session_state.keys()):
-            if (key.startswith("driver_") or key.startswith("defaults_applied")
-                    or key.startswith("changed_seen")):
-                del st.session_state[key]
-        st.rerun()
+    # Header row: Refresh | date | prep toggle — one line
+    _hdr_l, _hdr_m, _hdr_r = st.columns([1.1, 3.6, 1.0], vertical_alignment="center")
+    with _hdr_l:
+        if st.button("🔄 Refresh Data", help="Reload latest data from Google Sheets"):
+            st.cache_data.clear()
+            for key in list(st.session_state.keys()):
+                if (key.startswith("driver_") or key.startswith("defaults_applied")
+                        or key.startswith("changed_seen")):
+                    del st.session_state[key]
+            st.rerun()
 
     # ── Connect to Google Sheets ──
     try:
@@ -2512,15 +2514,17 @@ def main():
         if _want is not None:
             _match = next((l for l in _date_labels if parse_route_date(l) == _want), None)
         st.session_state["date_select"] = _match or _date_labels[_default_idx]
-    selected_date = st.selectbox("Select date:", _date_labels, key="date_select",
-                                 label_visibility="collapsed")
+    with _hdr_m:
+        selected_date = st.selectbox("Select date:", _date_labels, key="date_select",
+                                     label_visibility="collapsed")
     try:
         _has_custom_out = bool((st.secrets.get("output_sheet_id", "") or "").strip())
     except Exception:
         _has_custom_out = False
     if _has_custom_out:
-        st.toggle("🌙 Prep mode — write to 'Optimized Routes' (Routing sheet); Main Page untouched",
-                  key="prep_mode")
+        with _hdr_r:
+            st.toggle("🌙 Prep mode", key="prep_mode",
+                      help="Write to 'Optimized Routes' (Routing sheet) — Main Page untouched")
     try:
         st.query_params["d"] = selected_date  # pin the pick so reboots keep it
     except Exception:
