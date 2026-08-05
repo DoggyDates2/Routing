@@ -550,6 +550,12 @@ def parse_schedule(schedule_data, date_col_idx):
         # dog (pickup first digit, drop last digit, span capacity as usual).
         is_ride_along = "xx" in code.lower() and len(re.findall(r"\d", code)) >= 3
 
+        # Code ending in LETTERS (no digit at the end) = PICKUP ONLY, no
+        # drop-off stop. e.g. "1Potty" (potty visit — billing keyword kept in
+        # the Schedule) or "1XX" (overnight provider takes the dog; XX tells
+        # billing not to charge). Codes ending in a digit are normal.
+        no_dropoff = bool(code.strip()) and not code.strip()[-1].isdigit()
+
         # Handle "!" split — dog goes home between groups (e.g., "1!3" = group 1, then group 3 separately)
         if "!" in code:
             sub_codes = code.split("!")
@@ -562,6 +568,7 @@ def parse_schedule(schedule_data, date_col_idx):
                     "driver": driver_name,
                     "pickup_group": int(digits[0]),
                     "dropoff_group": int(digits[-1]),
+                    "no_dropoff": no_dropoff,
                     "dog_count": dog_count,
                     "is_staff_dog": (email == ""),
                     "is_ride_along": is_ride_along,
@@ -578,6 +585,7 @@ def parse_schedule(schedule_data, date_col_idx):
                 "driver": driver_name,
                 "pickup_group": int(digits[0]),
                 "dropoff_group": int(digits[-1]),
+                "no_dropoff": no_dropoff,
                 "dog_count": dog_count,
                 "is_staff_dog": (email == ""),
                 "is_ride_along": is_ride_along,
@@ -805,7 +813,8 @@ def solve_driver(matrix, driver_name, config, dogs, schedule_lookup):
         for g in groups:
             picks = [d for d in customer_dogs if d["pickup_group"] == g]
             drops = [d for d in customer_dogs
-                     if d["dropoff_group"] == g or (g == last_g and d["dropoff_group"] > g)]
+                     if (d["dropoff_group"] == g or (g == last_g and d["dropoff_group"] > g))
+                     and not d.get("no_dropoff")]
             for action, ds in (("PICK UP", picks), ("DROP OFF", drops)):
                 ds = _nn_order(ds, _dir_rd(ds, "pickup" if action == "PICK UP" else "dropoff"))
                 if not ds:
@@ -904,6 +913,7 @@ def solve_driver(matrix, driver_name, config, dogs, schedule_lookup):
                 (d["customer_id"], d["dog_count"])
                 for d in customer_dogs
                 if d["dropoff_group"] == prev_group and d["customer_id"] in matrix
+                and not d.get("no_dropoff")
             ]
             pickups = [
                 (d["customer_id"], d["dog_count"])
@@ -1034,6 +1044,7 @@ def solve_driver(matrix, driver_name, config, dogs, schedule_lookup):
             dropoff_dogs = [
                 d for d in customer_dogs
                 if d["dropoff_group"] >= last_group and d["customer_id"] in matrix
+                and not d.get("no_dropoff")
             ]
             if not dropoff_dogs:
                 continue
@@ -1086,8 +1097,10 @@ def solve_driver(matrix, driver_name, config, dogs, schedule_lookup):
                   f"stops for this dog ({_inmx}) — pickup/drop-off appended manually "
                   f"at the end of its trips. Drive order for it is NOT optimized.")
         _extra = get_extra_info(d["customer_id"])
-        for _act, _lg in (("PICK UP", d["pickup_group"]),
-                          ("DROP OFF", d["dropoff_group"] + 1)):
+        _acts = [("PICK UP", d["pickup_group"])]
+        if not d.get("no_dropoff"):
+            _acts.append(("DROP OFF", d["dropoff_group"] + 1))
+        for _act, _lg in _acts:
             results.append({
                 "Driver": driver_name, "Leg": _lg, "Stop": 999,
                 "Action": _act, "Customer ID": d["customer_id"],
@@ -1746,13 +1759,21 @@ def _surgical_compute(rows, matrix, driver_name, config, assignments, schedule_l
                 _prow[2] = _s + _prow[2]
         prev_name, cost, over = insert(tp, _prow, a["dog_count"], True,
                                        a["dog_name"] or cid)
-        _resolve_dropoff_trip(td, a)
+        if not a.get("no_dropoff"):
+            _resolve_dropoff_trip(td, a)
         _note = " ⚠️ over capacity — best available spot used." if over else ""
-        report.append(
-            f"{a['dog_name'] or cid}: picked up right after {prev_name} in {driver_name}{tp} "
-            f"(+{cost:.1f} min) — no other pickups moved. {driver_name}{td} drop-offs "
-            f"re-optimized to fit the new drop.{_note}"
-        )
+        if a.get("no_dropoff"):
+            report.append(
+                f"{a['dog_name'] or cid}: picked up right after {prev_name} in "
+                f"{driver_name}{tp} (+{cost:.1f} min) — PICKUP ONLY (code ends in "
+                f"letters), no drop-off created.{_note}"
+            )
+        else:
+            report.append(
+                f"{a['dog_name'] or cid}: picked up right after {prev_name} in {driver_name}{tp} "
+                f"(+{cost:.1f} min) — no other pickups moved. {driver_name}{td} drop-offs "
+                f"re-optimized to fit the new drop.{_note}"
+            )
 
     # ── assemble final rows ──
     final_rows = []
