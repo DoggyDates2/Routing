@@ -38,8 +38,11 @@ def _swap_bk(row):
 
 
 def _routes_tab_name():
-    """Output tab name — override with the output_tab_name secret (e.g. "Main Page")."""
+    """Output tab name — override with the output_tab_name secret (e.g. "Main Page").
+    🌙 Prep mode forces the default tab regardless of secrets."""
     try:
+        if st.session_state.get("prep_mode"):
+            return OUTPUT_TAB_NAME
         return (st.secrets.get("output_tab_name", "") or "").strip() or OUTPUT_TAB_NAME
     except Exception:
         return OUTPUT_TAB_NAME
@@ -50,6 +53,8 @@ def _open_output_sheet(client, default_sheet_name):
     secret to send routes to a different spreadsheet (share it with the service
     account as Editor). REMOVE the secret to switch back — no code change."""
     try:
+        if st.session_state.get("prep_mode"):
+            return client.open(default_sheet_name)  # 🌙 prep: default sheet, live data untouched
         _sid = (st.secrets.get("output_sheet_id", "") or "").strip()
     except Exception:
         _sid = ""
@@ -2414,8 +2419,9 @@ def main():
 
     st.markdown("""
         <style>
-        /* tighten vertical rhythm of checkboxes (driver grid + surgical list) */
-        div[data-testid="stCheckbox"] { margin-bottom: -1.1rem; }
+        /* tighten vertical rhythm of the DRIVER GRID checkboxes only —
+           full-width checkboxes (surgical list) keep normal spacing */
+        div[data-testid="column"] div[data-testid="stCheckbox"] { margin-bottom: -1.1rem; }
         div[data-testid="stCheckbox"] label p { font-size: 0.88rem; }
         /* slim the gaps between grid columns and stacked blocks */
         div[data-testid="column"] { padding: 0 0.25rem; }
@@ -2483,7 +2489,8 @@ def main():
         _now_et = _dtt.now(_ZI("America/New_York"))
     except Exception:
         _now_et = _dtt.now()
-    _target = _now_et.date() + _td(days=1) if _now_et.hour >= 14 else _now_et.date()
+    _target = (_now_et.date() + _td(days=1)
+               if (_now_et.hour, _now_et.minute) >= (16, 30) else _now_et.date())
     _date_labels = list(available_dates.keys())
     _default_idx = 0
     for _i, _lbl in enumerate(_date_labels):
@@ -2507,6 +2514,13 @@ def main():
         st.session_state["date_select"] = _match or _date_labels[_default_idx]
     selected_date = st.selectbox("Select date:", _date_labels, key="date_select",
                                  label_visibility="collapsed")
+    try:
+        _has_custom_out = bool((st.secrets.get("output_sheet_id", "") or "").strip())
+    except Exception:
+        _has_custom_out = False
+    if _has_custom_out:
+        st.toggle("🌙 Prep mode — write to 'Optimized Routes' (Routing sheet); Main Page untouched",
+                  key="prep_mode")
     try:
         st.query_params["d"] = selected_date  # pin the pick so reboots keep it
     except Exception:
@@ -2651,7 +2665,9 @@ def main():
         _osid = (st.secrets.get("output_sheet_id", "") or "").strip()
     except Exception:
         _osid = ""
-    if _osid:
+    if st.session_state.get("prep_mode"):
+        st.sidebar.caption(f"🌙 PREP MODE — writing to Routing sheet / {OUTPUT_TAB_NAME}")
+    elif _osid:
         st.sidebar.caption(f"🗂 Routes write to: custom sheet (…{_osid[-6:]}) / {_routes_tab_name()}")
     else:
         st.sidebar.caption(f"🗂 Routes write to: Routing sheet / {OUTPUT_TAB_NAME}")
