@@ -418,12 +418,17 @@ def check_address_changes(creds, schedule_data, matrix, ors_key, schedule_sheet_
         return matrix_text, set()
 
     # sync the in-memory dict so downstream steps (missing scan, repair) see truth
+    def _f(s):
+        try:
+            return float(str(s).strip().replace(",", "."))
+        except Exception:
+            return 9999.0
     for cid in moved_done:
         for oid in list(matrix.get(cid, {})):
-            matrix[cid][oid] = float(data_rows[row_idx[cid]][col_idx[oid]]) if oid in col_idx else 9999.0
+            matrix[cid][oid] = _f(data_rows[row_idx[cid]][col_idx[oid]]) if oid in col_idx else 9999.0
         for rid in matrix:
             if cid in matrix[rid] and rid in row_idx:
-                matrix[rid][cid] = float(data_rows[row_idx[rid]][col_idx[cid]])
+                matrix[rid][cid] = _f(data_rows[row_idx[rid]][col_idx[cid]])
 
     for i, r in enumerate(log_rows, start=1):
         if r and r[0].strip() in moved_done:
@@ -812,8 +817,10 @@ def repair_9999s(creds, matrix, schedule_data, file_id, matrix_text, ors_key):
     other_pairs = [p for p in pairs_to_fix if p not in priority_pairs]
     sorted_pairs = priority_pairs + other_pairs
 
-    # Fix up to 500 pairs per run
-    batch = sorted_pairs[:500]
+    # Fix up to 500 dog-dog pairs per run, plus a MUCH larger budget for
+    # field/parking pairs (every trip touches them; after an anchor reset the
+    # grouped calls make even thousands of anchor pairs only ~50-100 requests)
+    batch = priority_pairs[:4000] + other_pairs[:500]
     print(f"  Found {len(pairs_to_fix)} pairs with 9999 ({len(priority_pairs)} involve fields/parking). Fixing {len(batch)} this run...")
 
     # Parse CSV for editing
