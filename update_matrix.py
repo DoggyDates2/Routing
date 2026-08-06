@@ -227,6 +227,213 @@ def find_missing_temp_addresses(creds, sheet_id, matrix, ors_key):
     return queued
 
 
+def check_address_changes(creds, schedule_data, matrix, ors_key, schedule_sheet_id,
+                          file_id, matrix_text, max_movers_per_run=3):
+    """Detect dogs whose Schedule ADDRESS changed since their matrix distances
+    were measured (AddressLog tab, Routing sheet: A=id, B=address-as-measured).
+
+    For each mover (capped per run):
+      1. geocode the NEW address; update Schedule I/J and in-memory rows
+      2. RESET the dog's entire matrix row+column to 9999 in the CSV
+         (kills every stale old-house value, near and far)
+      3. refill NEARBY pairs (7-mile rule, same as adds) from the new house
+         via grouped ORS calls; far pairs stay 9999 by design
+      4. upload the CSV, THEN update the log — so a quota death mid-refill
+         leaves ordinary 9999s that the normal repair pass finishes later,
+         and a totally failed mover keeps its OLD log entry and retriggers.
+
+    First run seeds the log without re-measuring. Blank a dog's col-B cell to
+    force a re-measure. Returns (matrix_text, moved_ids) — matrix_text MUST be
+    reassigned by the caller so later steps see the reset."""
+    import gspread, math
+    try:
+        gc = gspread.authorize(creds)
+        routing_sheet_id = os.environ.get("ROUTING_SHEET_ID", "").strip()
+        book = gc.open_by_key(routing_sheet_id) if routing_sheet_id else gc.open(
+            os.environ.get("ROUTING_SHEET_NAME", "Routing"))
+        try:
+            ws = book.worksheet("AddressLog")
+        except gspread.exceptions.WorksheetNotFound:
+            ws = book.add_worksheet(title="AddressLog", rows=2500, cols=2)
+    except Exception as e:
+        print(f"  AddressLog unavailable ({e}) — skipping address-change check")
+        return matrix_text, set()
+
+    log_rows = ws.get_all_values()
+    logged = {r[0].strip(): (r[1].strip() if len(r) > 1 else "")
+              for r in log_rows if r and r[0].strip()}
+
+    current = {}
+    for row in schedule_data[1:]:
+        if len(row) > 6 and row[6].strip() and row[0].strip():
+            current[row[6].strip()] = " ".join(row[0].split())
+
+    if not logged:
+        seed = [[cid, addr] for cid, addr in sorted(current.items()) if cid in matrix]
+        if seed:
+            ws.update(range_name="A1", values=seed)
+            print(f"  AddressLog seeded with {len(seed)} dog(s) — tracking ON from next run. "
+                  f"(Blank a dog's col-B cell to force a re-measure.)")
+        return matrix_text, set()
+
+    changed = [cid for cid, addr in current.items()
+               if cid in matrix and cid in logged and logged[cid] != addr]
+    if changed:
+        print(f"  {len(changed)} dog(s) with a CHANGED address: "
+              f"{', '.join(changed[:12])}{'...' if len(changed) > 12 else ''}"
+              + (f" — handling {max_movers_per_run} this run" if len(changed) > max_movers_per_run else ""))
+
+    # coords for the 7-mile neighborhood test (Schedule + Locations)
+    coords_lookup = {}
+    for row in schedule_data[1:]:
+        if len(row) > 9 and row[6].strip():
+            _ll = parse_lat_lng(row[8], row[9])
+            if _ll:
+                coords_lookup[row[6].strip()] = {"lat": _ll[0], "lng": _ll[1]}
+    try:
+        loc_ws = book.worksheet("Locations")
+        for row in loc_ws.get_all_values()[1:]:
+            if len(row) >= 3 and row[0].strip():
+                _ll = parse_lat_lng(row[1], row[2])
+                if _ll:
+                    coords_lookup[row[0].strip()] = {"lat": _ll[0], "lng": _ll[1]}
+    except Exception:
+        pass
+
+    def _hav_mi(a, b):
+        R = 3958.8
+        p1, p2 = math.radians(a["lat"]), math.radians(b["lat"])
+        dp = math.radians(b["lat"] - a["lat"]); dl = math.radians(b["lng"] - a["lng"])
+        x = math.sin(dp/2)**2 + math.cos(p1)*math.cos(p2)*math.sin(dl/2)**2
+        return 2 * R * math.asin(math.sqrt(x))
+
+    reader = csv.reader(io.StringIO(matrix_text))
+    all_rows = list(reader)
+    header = all_rows[0]
+    data_rows = all_rows[1:]
+    col_idx = {h.strip(): i for i, h in enumerate(header)}
+    row_idx = {r[0].strip(): i for i, r in enumerate(data_rows)}
+
+    moved_done = []
+    for cid in changed[:max_movers_per_run]:
+        if _ORS_QUOTA_HIT["v"]:
+            print("    quota exhausted — remaining movers handled next run")
+            break
+        new_coords = ors_geocode(current[cid], ors_key)
+        if not new_coords:
+            print(f"    {cid}: could not geocode new address — will retry next run")
+            continue
+        # Schedule I/J + in-memory
+        try:
+            sched_ws = gc.open_by_key(schedule_sheet_id).worksheet("Schedule")
+            for ri, row in enumerate(schedule_data[1:], start=2):
+                if len(row) > 6 and row[6].strip() == cid:
+                    sched_ws.update(range_name=f"I{ri}:J{ri}",
+                                    values=[[new_coords["lat"], new_coords["lng"]]])
+                    while len(row) < 10:
+                        row.append("")
+                    row[8] = str(new_coords["lat"])
+                    row[9] = str(new_coords["lng"])
+                    break
+        except Exception as e:
+            print(f"    {cid}: coord write failed ({e}) — will retry next run")
+            continue
+        coords_lookup[cid] = new_coords
+
+        if cid not in row_idx or cid not in col_idx:
+            print(f"    {cid}: not present in matrix CSV — the add path will handle it")
+            continue
+        # RESET row + column to 9999 (self = 0)
+        ri = row_idx[cid]; ci = col_idx[cid]
+        for j in range(1, len(data_rows[ri])):
+            data_rows[ri][j] = "0" if j == ci else "9999"
+        for r in data_rows:
+            if len(r) > ci:
+                r[ci] = "0" if r[0].strip() == cid else "9999"
+        # refill NEARBY pairs from the NEW house (7-mile rule, both directions)
+        nearby = [oid for oid, c in coords_lookup.items()
+                  if oid != cid and oid in col_idx and oid in row_idx
+                  and (_hav_mi(new_coords, c) <= 7.0 or oid.endswith(("F", "P")))]
+        filled = 0
+        for direction in ("out", "in"):
+            for k in range(0, len(nearby), 45):
+                if _ORS_QUOTA_HIT["v"]:
+                    break
+                chunk = nearby[k:k + 45]
+                if direction == "out":
+                    locations = [[new_coords["lng"], new_coords["lat"]]] + [
+                        [coords_lookup[d]["lng"], coords_lookup[d]["lat"]] for d in chunk]
+                    payload = {"locations": locations, "sources": [0],
+                               "destinations": list(range(1, len(chunk) + 1)),
+                               "metrics": ["duration"]}
+                else:
+                    locations = [[coords_lookup[d]["lng"], coords_lookup[d]["lat"]] for d in chunk] + [
+                        [new_coords["lng"], new_coords["lat"]]]
+                    payload = {"locations": locations, "sources": list(range(len(chunk))),
+                               "destinations": [len(chunk)], "metrics": ["duration"]}
+                resp = _ors_matrix_call(
+                    "https://api.openrouteservice.org/v2/matrix/driving-car",
+                    {"Authorization": ors_key, "Content-Type": "application/json"},
+                    payload, print)
+                if resp is not None and resp.status_code == 200:
+                    durs = resp.json().get("durations", [])
+                    for j, d in enumerate(chunk):
+                        try:
+                            v = durs[0][j] if direction == "out" else durs[j][0]
+                        except Exception:
+                            v = None
+                        if v is None:
+                            continue
+                        val = str(round(v / 60, 1))
+                        if direction == "out":
+                            data_rows[row_idx[cid]][col_idx[d]] = val
+                        else:
+                            data_rows[row_idx[d]][col_idx[cid]] = val
+                        filled += 1
+                time.sleep(2.0)
+        print(f"    {cid}: reset stale row/col, refilled {filled}/{len(nearby) * 2} nearby "
+              f"pairs from '{current[cid][:40]}'"
+              + (" (rest finish via normal repair)" if filled < len(nearby) * 2 else ""))
+        moved_done.append(cid)
+
+    if not moved_done:
+        return matrix_text, set()
+
+    # upload the reset+refilled CSV, THEN update the log
+    out = io.StringIO()
+    w = csv.writer(out)
+    w.writerow(header)
+    w.writerows(data_rows)
+    new_text = out.getvalue()
+    try:
+        from googleapiclient.discovery import build
+        from googleapiclient.http import MediaIoBaseUpload
+        service = build("drive", "v3", credentials=creds)
+        media = MediaIoBaseUpload(io.BytesIO(new_text.encode("utf-8")),
+                                  mimetype="text/csv", resumable=True)
+        service.files().update(fileId=file_id, media_body=media).execute()
+        print(f"  Matrix uploaded with {len(moved_done)} re-measured mover(s)")
+    except Exception as e:
+        print(f"  Upload FAILED ({e}) — log NOT updated; movers retrigger next run")
+        return matrix_text, set()
+
+    # sync the in-memory dict so downstream steps (missing scan, repair) see truth
+    for cid in moved_done:
+        for oid in list(matrix.get(cid, {})):
+            matrix[cid][oid] = float(data_rows[row_idx[cid]][col_idx[oid]]) if oid in col_idx else 9999.0
+        for rid in matrix:
+            if cid in matrix[rid] and rid in row_idx:
+                matrix[rid][cid] = float(data_rows[row_idx[rid]][col_idx[cid]])
+
+    for i, r in enumerate(log_rows, start=1):
+        if r and r[0].strip() in moved_done:
+            ws.update(range_name=f"B{i}", values=[[current[r[0].strip()]]])
+    new_dogs = [cid for cid in current if cid not in logged and cid in matrix]
+    if new_dogs:
+        ws.append_rows([[cid, current[cid]] for cid in sorted(new_dogs)])
+    return new_text, set(moved_done)
+
+
 def find_missing_dogs(matrix, schedule_data):
     """Find dogs in the Schedule that aren't in the matrix."""
     matrix_ids = set(matrix.keys())
@@ -524,6 +731,11 @@ def main():
 
     # Find missing
     geocode_missing_coords(creds, schedule_data, schedule_sheet_id, matrix, ors_key)
+    print("Checking for changed addresses...")
+    matrix_text, _moved = check_address_changes(creds, schedule_data, matrix, ors_key,
+                                                schedule_sheet_id, file_id, matrix_text)
+    if _moved:
+        print(f"  {len(_moved)} moved dog(s) re-measured from their NEW address")
     missing = find_missing_dogs(matrix, schedule_data)
     temp_missing = find_missing_temp_addresses(creds, schedule_sheet_id, matrix, ors_key)
     if temp_missing:
