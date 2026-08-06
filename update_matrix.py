@@ -124,21 +124,40 @@ def parse_lat_lng(lat_raw, lng_raw):
 
 
 def ors_geocode(address, ors_key):
-    """Geocode a street address via ORS. Returns (lat, lng) or None."""
+    """Geocode a street address via ORS. Returns (lat, lng) or None.
+    TOWN-VERIFIED: the result's town must match the town written in the
+    address ("..., Wayland, MA" must resolve to Wayland). An ambiguous
+    street name resolved to another town is REJECTED, not silently used —
+    that silent substitution was the root cause of the 2026 anchor bug."""
     import requests
     if not address or not ors_key:
         return None
+    # expected town = the part right before the "MA" token
+    exp_town = ""
+    parts = [p.strip() for p in address.split(",") if p.strip()]
+    for i, p in enumerate(parts):
+        if p.upper().replace(".", "").startswith("MA") and len(p) <= 8 and i > 0:
+            exp_town = parts[i - 1].lower()
+            break
     try:
         r = requests.get(
             "https://api.openrouteservice.org/geocode/search",
             params={"api_key": ors_key, "text": address,
-                    "boundary.country": "US", "size": 1},
+                    "boundary.country": "US", "size": 3},
             timeout=15,
         )
         feats = r.json().get("features", [])
+        for f in feats:
+            props = f.get("properties", {})
+            towns = {str(props.get(k, "")).lower()
+                     for k in ("locality", "localadmin", "county", "name")}
+            if not exp_town or any(exp_town in t for t in towns if t):
+                lng, lat = f["geometry"]["coordinates"]
+                return float(lat), float(lng)
         if feats:
-            lng, lat = feats[0]["geometry"]["coordinates"]
-            return float(lat), float(lng)
+            _lbl = feats[0].get("properties", {}).get("label", "?")
+            print(f"  Geocode REJECTED for '{address}': best hit was '{_lbl}' "
+                  f"(wrong town) — not using it; will retry next run")
     except Exception as e:
         print(f"  Geocode failed for '{address}': {e}")
     return None
@@ -262,6 +281,8 @@ def check_address_changes(creds, schedule_data, matrix, ors_key, schedule_sheet_
     log_rows = ws.get_all_values()
     logged = {r[0].strip(): (r[1].strip() if len(r) > 1 else "")
               for r in log_rows if r and r[0].strip()}
+    logged_ll = {r[0].strip(): (r[2].strip() if len(r) > 2 else "")
+                 for r in log_rows if r and r[0].strip()}
 
     current = {}
     for row in schedule_data[1:]:
@@ -269,7 +290,23 @@ def check_address_changes(creds, schedule_data, matrix, ors_key, schedule_sheet_
             current[row[6].strip()] = " ".join(row[0].split())
 
     if not logged:
-        seed = [[cid, addr] for cid, addr in sorted(current.items()) if cid in matrix]
+        # One-time: the Aug 2026 audit found exactly these dogs mislocated in the
+        # original matrix build. Seeding them with a BLANK measured-address makes
+        # the mover machinery re-geocode and re-measure them automatically over
+        # the following runs — no manual cell-blanking needed. Harmless to leave
+        # in place: it only applies when the AddressLog is first created.
+        _force_remeasure = {"1203x", "1205x", "919x", "920x", "924x", "1454x",
+                            "1931x", "2396x", "2340x", "2388x", "2409x", "2416x",
+                            "1571x", "1733x", "2244x"}
+        _cur_ll = {}
+        for row in schedule_data[1:]:
+            if len(row) > 9 and row[6].strip():
+                _ll = parse_lat_lng(row[8], row[9])
+                if _ll:
+                    _cur_ll[row[6].strip()] = f"{_ll[0]},{_ll[1]}"
+        seed = [[cid, ("" if cid in _force_remeasure else addr),
+                 _cur_ll.get(cid, "")]
+                for cid, addr in sorted(current.items()) if cid in matrix]
         if seed:
             ws.update(range_name="A1", values=seed)
             print(f"  AddressLog seeded with {len(seed)} dog(s) — tracking ON from next run. "
@@ -319,25 +356,44 @@ def check_address_changes(creds, schedule_data, matrix, ors_key, schedule_sheet_
         if _ORS_QUOTA_HIT["v"]:
             print("    quota exhausted — remaining movers handled next run")
             break
-        new_coords = ors_geocode(current[cid], ors_key)
-        if not new_coords:
-            print(f"    {cid}: could not geocode new address — will retry next run")
-            continue
-        # Schedule I/J + in-memory
-        try:
-            sched_ws = gc.open_by_key(schedule_sheet_id).worksheet("Schedule")
-            for ri, row in enumerate(schedule_data[1:], start=2):
-                if len(row) > 6 and row[6].strip() == cid:
-                    sched_ws.update(range_name=f"I{ri}:J{ri}",
-                                    values=[[new_coords["lat"], new_coords["lng"]]])
-                    while len(row) < 10:
-                        row.append("")
-                    row[8] = str(new_coords["lat"])
-                    row[9] = str(new_coords["lng"])
-                    break
-        except Exception as e:
-            print(f"    {cid}: coord write failed ({e}) — will retry next run")
-            continue
+        # COORDINATES FIRST: if the Schedule's lat/lng for this dog is fresh
+        # (hand-updated — differs from the logged coords) or this is a forced
+        # re-measure with usable coords, trust the Schedule's exact numbers
+        # verbatim. Geocode only when the coords are absent or stale.
+        _cur = None
+        _srow = None
+        for row in schedule_data[1:]:
+            if len(row) > 6 and row[6].strip() == cid:
+                _srow = row
+                if len(row) > 9:
+                    _cur = parse_lat_lng(row[8], row[9])
+                break
+        _cur_s = f"{_cur[0]},{_cur[1]}" if _cur else ""
+        _fresh = bool(_cur) and (_cur_s != logged_ll.get(cid, "") or not logged[cid])
+        if _fresh:
+            new_coords = {"lat": _cur[0], "lng": _cur[1]}
+            print(f"    {cid}: using Schedule's exact lat/lng (hand-updated) — no geocoding")
+        else:
+            _g = ors_geocode(current[cid], ors_key)
+            if not _g:
+                print(f"    {cid}: could not geocode new address — will retry next run")
+                continue
+            new_coords = {"lat": _g[0], "lng": _g[1]}
+            try:
+                sched_ws = gc.open_by_key(schedule_sheet_id).worksheet("Schedule")
+                for ri, row in enumerate(schedule_data[1:], start=2):
+                    if len(row) > 6 and row[6].strip() == cid:
+                        sched_ws.update(range_name=f"I{ri}:J{ri}",
+                                        values=[[new_coords["lat"], new_coords["lng"]]])
+                        break
+            except Exception as e:
+                print(f"    {cid}: coord write failed ({e}) — will retry next run")
+                continue
+        if _srow is not None:
+            while len(_srow) < 10:
+                _srow.append("")
+            _srow[8] = str(new_coords["lat"])
+            _srow[9] = str(new_coords["lng"])
         coords_lookup[cid] = new_coords
 
         if cid not in row_idx or cid not in col_idx:
@@ -431,8 +487,11 @@ def check_address_changes(creds, schedule_data, matrix, ors_key, schedule_sheet_
                 matrix[rid][cid] = _f(data_rows[row_idx[rid]][col_idx[cid]])
 
     for i, r in enumerate(log_rows, start=1):
-        if r and r[0].strip() in moved_done:
-            ws.update(range_name=f"B{i}", values=[[current[r[0].strip()]]])
+        cid = r[0].strip() if r else ""
+        if cid in moved_done:
+            _c = coords_lookup.get(cid, {})
+            _cs = f"{_c.get('lat','')},{_c.get('lng','')}" if _c else ""
+            ws.update(range_name=f"B{i}:C{i}", values=[[current[cid], _cs]])
     new_dogs = [cid for cid in current if cid not in logged and cid in matrix]
     if new_dogs:
         ws.append_rows([[cid, current[cid]] for cid in sorted(new_dogs)])
