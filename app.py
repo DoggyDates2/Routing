@@ -289,9 +289,9 @@ def get_active_temps(temp_rows, route_date):
                     _m = (row[7].strip().lower() if len(row) > 7 else "")
                     if _m in ("", "both"):
                         mode = "both"
-                    elif _m.startswith("pick") or _m.startswith("pu"):
+                    elif _m.startswith("p"):
                         mode = "pickup"
-                    elif _m.startswith("drop") or _m.startswith("do"):
+                    elif _m.startswith("d"):
                         mode = "dropoff"
                     else:
                         problems.append(f"{orig}: direction '{_m}' in col H not recognized — using both")
@@ -315,9 +315,9 @@ def get_active_temps(temp_rows, route_date):
                     _pm = (row[15].strip().lower() if len(row) > 15 else "")
                     if _pm in ("", "both"):
                         n_mode = "both"
-                    elif _pm.startswith("pick") or _pm.startswith("pu"):
+                    elif _pm.startswith("p"):
                         n_mode = "pickup"
-                    elif _pm.startswith("drop") or _pm.startswith("do"):
+                    elif _pm.startswith("d"):
                         n_mode = "dropoff"
                     else:
                         problems.append(f"{n_cid}: direction '{_pm}' in col P not recognized — using both")
@@ -2722,17 +2722,21 @@ def main():
 
     # ── Auto-check for missing dogs and add them ──
     all_matrix_ids = set(matrix.keys())
+    # A FAILED add has essentially ZERO real distances. An EDGE-OF-TERRITORY
+    # dog (e.g. 2387x in Maynard) legitimately has 9999 to most of the matrix
+    # but dozens-to-hundreds of real distances to its own area — healthy, and
+    # a %-based test wrongly flags it. So: flag only near-empty rows.
     _damaged_ids = sorted(
         rid for rid, drow in matrix.items()
         if not ANCHOR_ID_RE.match(rid) and drow
-        and sum(1 for v in drow.values() if float(v) >= 9000) > len(drow) * 0.9
+        and sum(1 for v in drow.values() if float(v) < 9000) < 10
     )
     if _damaged_ids:
         st.warning(
-            f"🩹 {len(_damaged_ids)} dog(s) in the matrix have almost entirely 9999 rows "
-            f"(>90% — a failed add): {', '.join(_damaged_ids)}. Remove them so they can be "
-            f"re-added cleanly. (Dogs with real distances to their nearby area are healthy "
-            f"even if far-away pairs are 9999 — those are by design and not flagged.)"
+            f"🩹 {len(_damaged_ids)} dog(s) in the matrix have (almost) no real distances "
+            f"— a failed add: {', '.join(_damaged_ids)}. Remove them so they can be "
+            f"re-added cleanly. (Outlier dogs with real distances to their own area are "
+            f"healthy even if far-away pairs are 9999 — those are not flagged.)"
         )
         if st.button(f"🗑 Remove {len(_damaged_ids)} damaged dog(s) from matrix"):
             with st.spinner("Purging damaged rows from matrix.csv..."):
