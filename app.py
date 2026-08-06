@@ -2672,6 +2672,20 @@ def main():
         st.sidebar.caption(f"🗂 Routes write to: custom sheet (…{_osid[-6:]}) / {_routes_tab_name()}")
     else:
         st.sidebar.caption(f"🗂 Routes write to: Routing sheet / {OUTPUT_TAB_NAME}")
+    with st.sidebar.expander("🔍 Check a matrix pair"):
+        _pa = st.text_input("Dog ID A", key="pairchk_a").strip()
+        _pb = st.text_input("Dog ID B", key="pairchk_b").strip()
+        if _pa and _pb:
+            _mraw = matrix._m if isinstance(matrix, _TempMatrixView) else matrix
+            for _x, _y in ((_pa, _pb), (_pb, _pa)):
+                if _x not in _mraw:
+                    st.write(f"❌ {_x}: not in matrix")
+                elif _y not in _mraw.get(_x, {}):
+                    st.write(f"{_x} → {_y}: no entry")
+                else:
+                    _vf = float(_mraw[_x][_y])
+                    st.write(f"{_x} → {_y}: **{_vf:g} min**"
+                             + ("  ⚠️ = never measured" if _vf >= 9000 else ""))
     _bd = load_birthdays(client, SHEET_NAME)
     if _bd is None:
         st.sidebar.warning("🎂 Birthdays tab NOT FOUND (checked Routing + Schedule spreadsheets)")
