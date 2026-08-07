@@ -272,8 +272,10 @@ def check_address_changes(creds, schedule_data, matrix, ors_key, schedule_sheet_
             os.environ.get("ROUTING_SHEET_NAME", "Routing"))
         try:
             ws = book.worksheet("AddressLog")
+            if getattr(ws, "col_count", 3) < 3:
+                ws.resize(cols=3)   # earlier builds created it 2 wide
         except gspread.exceptions.WorksheetNotFound:
-            ws = book.add_worksheet(title="AddressLog", rows=2500, cols=2)
+            ws = book.add_worksheet(title="AddressLog", rows=2500, cols=3)
     except Exception as e:
         print(f"  AddressLog unavailable ({e}) — skipping address-change check")
         return matrix_text, set()
@@ -486,15 +488,20 @@ def check_address_changes(creds, schedule_data, matrix, ors_key, schedule_sheet_
             if cid in matrix[rid] and rid in row_idx:
                 matrix[rid][cid] = _f(data_rows[row_idx[rid]][col_idx[cid]])
 
-    for i, r in enumerate(log_rows, start=1):
-        cid = r[0].strip() if r else ""
-        if cid in moved_done:
-            _c = coords_lookup.get(cid, {})
-            _cs = f"{_c.get('lat','')},{_c.get('lng','')}" if _c else ""
-            ws.update(range_name=f"B{i}:C{i}", values=[[current[cid], _cs]])
-    new_dogs = [cid for cid in current if cid not in logged and cid in matrix]
-    if new_dogs:
-        ws.append_rows([[cid, current[cid]] for cid in sorted(new_dogs)])
+    try:
+        for i, r in enumerate(log_rows, start=1):
+            cid = r[0].strip() if r else ""
+            if cid in moved_done:
+                _c = coords_lookup.get(cid, {})
+                _cs = f"{_c.get('lat','')},{_c.get('lng','')}" if _c else ""
+                ws.update(range_name=f"B{i}:C{i}", values=[[current[cid], _cs]])
+        new_dogs = [cid for cid in current if cid not in logged and cid in matrix]
+        if new_dogs:
+            ws.append_rows([[cid, current[cid], ""] for cid in sorted(new_dogs)])
+    except Exception as e:
+        # a failed log write only means the mover re-triggers next run — never
+        # allowed to crash the run and block the repair pass behind it
+        print(f"  AddressLog write failed ({e}) — movers will re-verify next run")
     return new_text, set(moved_done)
 
 
@@ -796,10 +803,13 @@ def main():
     # Find missing
     geocode_missing_coords(creds, schedule_data, schedule_sheet_id, matrix, ors_key)
     print("Checking for changed addresses...")
-    matrix_text, _moved = check_address_changes(creds, schedule_data, matrix, ors_key,
-                                                schedule_sheet_id, file_id, matrix_text)
-    if _moved:
-        print(f"  {len(_moved)} moved dog(s) re-measured from their NEW address")
+    try:
+        matrix_text, _moved = check_address_changes(creds, schedule_data, matrix, ors_key,
+                                                    schedule_sheet_id, file_id, matrix_text)
+        if _moved:
+            print(f"  {len(_moved)} moved dog(s) re-measured from their NEW address")
+    except Exception as e:
+        print(f"  Address-change check crashed ({e}) — continuing; repair still runs")
     missing = find_missing_dogs(matrix, schedule_data)
     temp_missing = find_missing_temp_addresses(creds, schedule_sheet_id, matrix, ors_key)
     if temp_missing:
