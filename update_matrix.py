@@ -249,7 +249,8 @@ def find_missing_temp_addresses(creds, sheet_id, matrix, ors_key):
 def check_address_changes(creds, schedule_data, matrix, ors_key, schedule_sheet_id,
                           file_id, matrix_text, max_movers_per_run=3):
     """Detect dogs whose Schedule ADDRESS changed since their matrix distances
-    were measured (AddressLog tab, Routing sheet: A=id, B=address-as-measured).
+    were measured (AddressLog tab, Routing sheet: A=id, B=address-as-measured,
+    C=coords-as-measured, D=date last measured — an audit trail of matrix adds).
 
     For each mover (capped per run):
       1. geocode the NEW address; update Schedule I/J and in-memory rows
@@ -264,7 +265,7 @@ def check_address_changes(creds, schedule_data, matrix, ors_key, schedule_sheet_
     First run seeds the log without re-measuring. Blank a dog's col-B cell to
     force a re-measure. Returns (matrix_text, moved_ids) — matrix_text MUST be
     reassigned by the caller so later steps see the reset."""
-    import gspread, math
+    import gspread, math, datetime
     try:
         gc = gspread.authorize(creds)
         routing_sheet_id = os.environ.get("ROUTING_SHEET_ID", "").strip()
@@ -272,10 +273,10 @@ def check_address_changes(creds, schedule_data, matrix, ors_key, schedule_sheet_
             os.environ.get("ROUTING_SHEET_NAME", "Routing"))
         try:
             ws = book.worksheet("AddressLog")
-            if getattr(ws, "col_count", 3) < 3:
-                ws.resize(cols=3)   # earlier builds created it 2 wide
+            if getattr(ws, "col_count", 4) < 4:
+                ws.resize(cols=4)   # A=id B=address C=coords D=last-measured date
         except gspread.exceptions.WorksheetNotFound:
-            ws = book.add_worksheet(title="AddressLog", rows=2500, cols=3)
+            ws = book.add_worksheet(title="AddressLog", rows=2500, cols=4)
     except Exception as e:
         print(f"  AddressLog unavailable ({e}) — skipping address-change check")
         return matrix_text, set()
@@ -307,7 +308,7 @@ def check_address_changes(creds, schedule_data, matrix, ors_key, schedule_sheet_
                 if _ll:
                     _cur_ll[row[6].strip()] = f"{_ll[0]},{_ll[1]}"
         seed = [[cid, ("" if cid in _force_remeasure else addr),
-                 _cur_ll.get(cid, "")]
+                 _cur_ll.get(cid, ""), ""]   # D=last-measured (blank = pre-existing/original)
                 for cid, addr in sorted(current.items()) if cid in matrix]
         if seed:
             ws.update(range_name="A1", values=seed)
@@ -494,10 +495,12 @@ def check_address_changes(creds, schedule_data, matrix, ors_key, schedule_sheet_
             if cid in moved_done:
                 _c = coords_lookup.get(cid, {})
                 _cs = f"{_c.get('lat','')},{_c.get('lng','')}" if _c else ""
-                ws.update(range_name=f"B{i}:C{i}", values=[[current[cid], _cs]])
+                _today = datetime.date.today().isoformat()
+                ws.update(range_name=f"B{i}:D{i}", values=[[current[cid], _cs, _today]])
         new_dogs = [cid for cid in current if cid not in logged and cid in matrix]
         if new_dogs:
-            ws.append_rows([[cid, current[cid], ""] for cid in sorted(new_dogs)])
+            _today = datetime.date.today().isoformat()
+            ws.append_rows([[cid, current[cid], "", _today] for cid in sorted(new_dogs)])
     except Exception as e:
         # a failed log write only means the mover re-triggers next run — never
         # allowed to crash the run and block the repair pass behind it
@@ -770,6 +773,114 @@ def add_dogs_to_matrix(creds, matrix, missing_dogs, schedule_data, file_id, matr
     return matrix, added_count
 
 
+def audit_matrix_health(creds, matrix, schedule_data, auto_queue=2):
+    """Nightly self-audit: does every dog's matrix data agree with its coordinates?
+    For each dog, compare matrix minutes to road-estimate for its ~12 nearest
+    neighbors (within 7 mi). A dog whose near cells are systematically inflated
+    (median +7 min AND x1.9 geometry) is concluded MISLOCATED; milder cases are
+    WATCH. Conclusions are written to the MatrixHealth tab (Routing sheet), and
+    the worst offenders are AUTO-QUEUED for re-measurement by blanking their
+    AddressLog col-B cell — so mislocated dogs heal without anyone noticing them
+    first. Never fatal: any failure just logs and the run continues."""
+    import gspread, math, datetime, statistics
+    coords = {}
+    for row in schedule_data[1:]:
+        if len(row) > 9 and row[6].strip():
+            _ll = parse_lat_lng(row[8], row[9])
+            if _ll:
+                coords[row[6].strip()] = (_ll[0], _ll[1], row[0].strip())
+    ids = [i for i in coords if i in matrix]
+    if len(ids) < 20:
+        return
+    def _hav(a, b):
+        R = 3958.8
+        p1, p2 = math.radians(a[0]), math.radians(b[0])
+        dp = math.radians(b[0] - a[0]); dl = math.radians(b[1] - a[1])
+        x = math.sin(dp/2)**2 + math.cos(p1)*math.cos(p2)*math.sin(dl/2)**2
+        return 2 * R * math.asin(math.sqrt(x))
+    findings = []
+    pts = [(i, coords[i][0], coords[i][1]) for i in ids]
+    for a, ala, alo in pts:
+        near = sorted(((_hav((ala, alo), (bla, blo)), b)
+                       for b, bla, blo in pts if b != a))[:12]
+        near = [(d, b) for d, b in near if d <= 7.0]
+        if len(near) < 5:
+            continue
+        excess, ratio, evid = [], [], None
+        for d, b in near:
+            m = matrix.get(a, {}).get(b)
+            if m is None or m >= 9000:
+                continue
+            est = d / 28 * 60 + 1
+            excess.append(m - est)
+            ratio.append(m / est)
+            if evid is None:
+                evid = f"nearest {b} is {d:.1f} mi (~{est:.0f} min) but matrix says {m:.0f} min"
+        if len(excess) >= 5:
+            me, mr = statistics.median(excess), statistics.median(ratio)
+            # conviction requires PHYSICAL impossibility, not just statistics:
+            # >=2 near neighbors (<=0.6 mi) whose matrix minutes no road network
+            # could produce. Statistical inflation alone is only WATCH (twisty
+            # roads, rivers and conservation land legitimately inflate pairs).
+            impossible = 0
+            for d, b in near:
+                if d <= 1.2:
+                    m = matrix.get(a, {}).get(b)
+                    est = d / 28 * 60 + 1
+                    # impossible = at least triple the road estimate AND 6+ min over
+                    if m is not None and m < 9000 and m >= max(est + 6, est * 3):
+                        impossible += 1
+                        if impossible == 1:
+                            evid = (f"{b} is {d:.1f} mi away (~{est:.0f} min) "
+                                    f"but matrix says {m:.0f} min — physically impossible")
+            if impossible >= 2 and me >= 5:
+                findings.append(("MISLOCATED", a, coords[a][2], me, mr, evid))
+            elif me >= 4.5 and mr >= 1.6:
+                findings.append(("WATCH", a, coords[a][2], me, mr, evid))
+    findings.sort(key=lambda x: -x[3])
+    strong = [f for f in findings if f[0] == "MISLOCATED"]
+    print(f"  🩺 Matrix health: {len(strong)} mislocated, "
+          f"{len(findings) - len(strong)} watch-list (of {len(ids)} dogs audited)")
+    try:
+        gc = gspread.authorize(creds)
+        routing_sheet_id = os.environ.get("ROUTING_SHEET_ID", "").strip()
+        book = gc.open_by_key(routing_sheet_id) if routing_sheet_id else gc.open(
+            os.environ.get("ROUTING_SHEET_NAME", "Routing"))
+        try:
+            ws = book.worksheet("MatrixHealth")
+        except gspread.exceptions.WorksheetNotFound:
+            ws = book.add_worksheet(title="MatrixHealth", rows=60, cols=6)
+        today = datetime.date.today().isoformat()
+        rows = [["Verdict", "Dog ID", "Address", "How far off", "Evidence", f"Checked {today}"]]
+        if not findings:
+            rows.append(["✅ HEALTHY", "", "all dogs' distances agree with their coordinates", "", "", ""])
+        for v, a, addr, me, mr, evid in findings[:40]:
+            fix = "auto-queued for re-measure" if v == "MISLOCATED" else "monitoring"
+            rows.append([v, a, addr[:45], f"+{me:.0f} min (x{mr:.1f})", evid or "", fix])
+        ws.clear()
+        ws.update(range_name="A1", values=rows)
+    except Exception as e:
+        print(f"  MatrixHealth tab write failed ({e}) — continuing")
+    # auto-queue the worst offenders: blank AddressLog col B so the mover
+    # machinery re-measures them from their coordinates on following runs
+    if strong and auto_queue > 0:
+        try:
+            ws2 = book.worksheet("AddressLog")
+            log_rows = ws2.get_all_values()
+            queued = 0
+            for v, a, addr, me, mr, evid in strong:
+                if queued >= auto_queue:
+                    break
+                for i, r in enumerate(log_rows, start=1):
+                    if r and r[0].strip() == a and (len(r) < 2 or r[1].strip()):
+                        ws2.update(range_name=f"B{i}", values=[[""]])
+                        print(f"    auto-queued {a} for re-measurement tonight ({evid})")
+                        queued += 1
+                        break
+        except Exception as e:
+            print(f"  auto-queue failed ({e}) — findings still listed in MatrixHealth")
+
+
 def main():
     print("=" * 50)
     print("Matrix Update Check")
@@ -833,6 +944,12 @@ def main():
     # ── Fix 9999 entries (batch of 50 pairs per run) ──
     print("\nChecking for 9999 entries to repair...")
     repair_9999s(creds, matrix, schedule_data, file_id, matrix_text, ors_key)
+
+    print("Auditing matrix health...")
+    try:
+        audit_matrix_health(creds, matrix, schedule_data)
+    except Exception as e:
+        print(f"  health audit crashed ({e}) — run continues")
     print("✅ Matrix update complete.")
 
 
