@@ -231,16 +231,26 @@ def find_missing_temp_addresses(creds, sheet_id, matrix, ors_key):
         return {}
     queued = {}
     # Layout: A=Customer Name, B=original ID, C=temp ID, D=temp address, E/F=dates
+    _placeholder = {"new id", "new address", "id", "address", "temp id", "temp address", "example"}
     for row in rows[1:]:
         temp = row[2].strip() if len(row) > 2 else ""
         addr = row[3].strip() if len(row) > 3 else ""
         if not temp or not addr or temp in matrix or temp in queued:
+            continue
+        # skip template/placeholder rows ("New ID @ New Address" etc.)
+        if temp.lower() in _placeholder or addr.lower() in _placeholder:
             continue
         res = ors_geocode(addr, ors_key)
         if not res:
             print(f"  ✗ temp address {temp}: could not geocode '{addr}'")
             continue
         lat, lng = res
+        # region guard: service area is eastern Massachusetts — anything outside
+        # is a bad geocode or bad row, never a real stop
+        if not (41.5 <= lat <= 43.2 and -72.5 <= lng <= -70.0):
+            print(f"  ✗ temp address {temp}: geocoded OUTSIDE the service region "
+                  f"({lat:.3f},{lng:.3f}) — skipping, check the row/address")
+            continue
         queued[temp] = {"lat": lat, "lng": lng}
         print(f"  + temp address {temp} @ '{addr[:40]}' queued for matrix add")
     return queued
