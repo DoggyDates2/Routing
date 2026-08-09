@@ -412,14 +412,18 @@ def check_address_changes(creds, schedule_data, matrix, ors_key, schedule_sheet_
         if cid not in row_idx or cid not in col_idx:
             print(f"    {cid}: not present in matrix CSV — the add path will handle it")
             continue
-        # RESET row + column to 9999 (self = 0)
         ri = row_idx[cid]; ci = col_idx[cid]
-        for j in range(1, len(data_rows[ri])):
-            data_rows[ri][j] = "0" if j == ci else "9999"
-        for r in data_rows:
-            if len(r) > ci:
-                r[ci] = "0" if r[0].strip() == cid else "9999"
+        did_reset = False
+        def _apply_reset():
+            for j in range(1, len(data_rows[ri])):
+                data_rows[ri][j] = "0" if j == ci else "9999"
+            for r in data_rows:
+                if len(r) > ci:
+                    r[ci] = "0" if r[0].strip() == cid else "9999"
         # refill NEARBY pairs from the NEW house (7-mile rule, both directions)
+        # NOTE: the stale row is wiped only after the FIRST successful ORS call,
+        # so a dead-quota run leaves the dog usable (stale) instead of an empty
+        # shell that the app then flags as a failed id.
         nearby = [oid for oid, c in coords_lookup.items()
                   if oid != cid and oid in col_idx and oid in row_idx
                   and (_hav_mi(new_coords, c) <= 7.0 or oid.endswith(("F", "P")))]
@@ -445,6 +449,9 @@ def check_address_changes(creds, schedule_data, matrix, ors_key, schedule_sheet_
                     {"Authorization": ors_key, "Content-Type": "application/json"},
                     payload, print)
                 if resp is not None and resp.status_code == 200:
+                    if not did_reset:
+                        _apply_reset()
+                        did_reset = True
                     durs = resp.json().get("durations", [])
                     for j, d in enumerate(chunk):
                         try:
@@ -460,6 +467,9 @@ def check_address_changes(creds, schedule_data, matrix, ors_key, schedule_sheet_
                             data_rows[row_idx[d]][col_idx[cid]] = val
                         filled += 1
                 time.sleep(2.0)
+        if not did_reset:
+            print(f"    {cid}: quota dead before any measurement — left stale (usable), retry next run")
+            continue
         print(f"    {cid}: reset stale row/col, refilled {filled}/{len(nearby) * 2} nearby "
               f"pairs from '{current[cid][:40]}'"
               + (" (rest finish via normal repair)" if filled < len(nearby) * 2 else ""))
