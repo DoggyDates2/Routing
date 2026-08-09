@@ -542,15 +542,17 @@ def find_missing_dogs(matrix, schedule_data):
 
         # Check if this dog has any assignment in any date column
         has_assignment = False
+        first_col = None
         for col_idx in range(10, min(len(row), 53)):
             val = row[col_idx].strip()
             if val and ":" in val and "cancel" not in val.lower():
                 has_assignment = True
+                first_col = col_idx
                 break
 
         if has_assignment:
             try:
-                missing[cid] = {"lat": float(lat), "lng": float(lng)}
+                missing[cid] = {"lat": float(lat), "lng": float(lng), "prio": first_col}
             except ValueError:
                 continue
 
@@ -651,7 +653,9 @@ def add_dogs_to_matrix(creds, matrix, missing_dogs, schedule_data, file_id, matr
 
     _ORS_QUOTA_HIT["v"] = False
     added_count = 0
-    for new_id, new_coords in missing_dogs.items():
+    # soonest-scheduled first (earliest date column wins; temps last)
+    for new_id, new_coords in sorted(missing_dogs.items(),
+                                     key=lambda kv: kv[1].get("prio", 999)):
         if _ORS_QUOTA_HIT["v"]:
             print("    Daily ORS quota exhausted — skipping remaining dogs this run.")
             break
