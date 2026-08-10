@@ -627,8 +627,15 @@ def parse_staff(data):
 
 
 def derive_groups(assignments, driver_name):
-    """Determine a driver's groups from actual assignments in the Schedule tab."""
-    driver_dogs = [a for a in assignments if a["driver"] == driver_name]
+    """Determine a driver's groups from actual assignments in the Schedule tab.
+
+    Only dogs that actually get ROUTED count toward the leg structure: staff/
+    personal dogs (blank email, e.g. an arbitrary 'Ali:123' on a staffer's own
+    dog) and ride-along XX dogs (e.g. 'Ali:1XX23' overnights) occupy capacity
+    but never create a group. Without this, a phantom group 3 sends a driver
+    back to the field after their real last group instead of to parking."""
+    driver_dogs = [a for a in assignments if a["driver"] == driver_name
+                   and not a["is_staff_dog"] and not a.get("is_ride_along")]
     pickup_groups = set(a["pickup_group"] for a in driver_dogs)
     return sorted(pickup_groups)
     return drivers
@@ -640,6 +647,8 @@ def derive_groups(assignments, driver_name):
 
 def solve_driver(matrix, driver_name, config, dogs, schedule_lookup):
     groups = config["groups"]
+    if not groups:
+        return []   # nothing routable (staff/ride-along only) — no legs to build
     field = config["field_id"]
     parking = config["parking_id"]
     capacity = config["capacity"]
@@ -2906,6 +2915,33 @@ def main():
     if changes is not None:
         changed_drivers = set(changes.keys())
         if changed_drivers:
+            # drivers who LOST ALL their dogs vanish from the checklist below, so
+            # their old sheet rows would silently go stale — surface + clean them
+            _emptied = sorted(changed_drivers - set(d["name"] for d in active_drivers_with_dogs))
+            if _emptied:
+                st.warning("⚠️ " + ", ".join(_emptied) +
+                           (" no longer has" if len(_emptied) == 1 else " no longer have") +
+                           " any dogs assigned — their old rows on the sheet are stale.")
+                if st.button(f"🧹 Clear stale rows for: {', '.join(_emptied)}", key="clear_emptied"):
+                    try:
+                        import re as _re
+                        _ws = _open_output_sheet(client, SHEET_NAME).worksheet(_routes_tab_name())
+                        _vals = _ws.get_all_values()
+                        _keep = []
+                        _removed = 0
+                        for _r in _vals:
+                            _trip = (_r[9].strip() if len(_r) > 9 else "")
+                            _drv = _re.sub(r"\d.*$", "", _trip)
+                            if _trip and _drv in _emptied:
+                                _removed += 1
+                                continue
+                            _keep.append(_r)
+                        _ws.clear()
+                        if _keep:
+                            _ws.update(range_name="A1", values=_keep)
+                        st.success(f"🧹 Removed {_removed} stale row(s) for {', '.join(_emptied)}.")
+                    except Exception as _e:
+                        st.error(f"Cleanup failed: {_e}")
             changed_active = changed_drivers & set(d["name"] for d in active_drivers_with_dogs)
             if changed_active:
                 # Count total changes
