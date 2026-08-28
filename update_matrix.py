@@ -142,10 +142,20 @@ def ors_geocode(address, ors_key):
     try:
         r = requests.get(
             "https://api.openrouteservice.org/geocode/search",
-            params={"api_key": ors_key, "text": address,
+            params={"api_key": _ors_auth(ors_key), "text": address,
                     "boundary.country": "US", "size": 3},
             timeout=15,
         )
+        if r.status_code == 403 and _ors_backup_key() and not _ORS_KEY_STATE["switched"]:
+            _ORS_KEY_STATE["active"] = _ors_backup_key()
+            _ORS_KEY_STATE["switched"] = True
+            print("  ORS primary key quota exhausted on geocode — switching to backup key (ORS_API_KEY_2)")
+            r = requests.get(
+                "https://api.openrouteservice.org/geocode/search",
+                params={"api_key": _ORS_KEY_STATE["active"], "text": address,
+                        "boundary.country": "US", "size": 3},
+                timeout=15,
+            )
         feats = r.json().get("features", [])
         for f in feats:
             props = f.get("properties", {})
@@ -571,20 +581,82 @@ def find_missing_dogs(matrix, schedule_data):
 
 _ORS_QUOTA_HIT = {"v": False}
 
+# KEY FAILOVER: when the primary ORS key's daily quota dies (403), switch to
+# the backup key in the ORS_API_KEY_2 secret (a second free ORS account) and
+# keep working. "active" holds the backup key once switched; every ORS call
+# funnels through _ors_matrix_call / ors_geocode, which check it.
+_ORS_KEY_STATE = {"active": None, "switched": False}
+
+
+def _ors_backup_key():
+    return os.environ.get("ORS_API_KEY_2", "").strip()
+
+
+def _ors_auth(primary_key):
+    """The key every ORS call should use right now."""
+    return _ORS_KEY_STATE["active"] or primary_key
+
+
+def _osrm_table(new_loc, batch_coords, new_is_source, log):
+    """QUOTA BACKUP measurement: real road driving times from the public OSRM
+    server (router.project-osrm.org — no key, no daily quota, same OSM road
+    network ORS routes on). Returns list of minutes (or None per slot), or None
+    if the request failed entirely. new_loc/batch_coords are [lng, lat]."""
+    import time as _t
+    import requests as _rq
+    coords = ";".join(f"{c[0]},{c[1]}" for c in [new_loc] + batch_coords)
+    n = len(batch_coords)
+    dest_idx = ";".join(str(i) for i in range(1, n + 1))
+    if new_is_source:
+        params = {"sources": "0", "destinations": dest_idx, "annotations": "duration"}
+    else:
+        params = {"sources": dest_idx, "destinations": "0", "annotations": "duration"}
+    url = f"https://router.project-osrm.org/table/v1/driving/{coords}"
+    for attempt in (1, 2, 3):
+        try:
+            resp = _rq.get(url, params=params, timeout=60)
+            if resp.status_code == 200:
+                dur = resp.json().get("durations") or []
+                out = []
+                for i in range(n):
+                    v = dur[0][i] if new_is_source else (dur[i][0] if i < len(dur) and dur[i] else None)
+                    out.append(round(v / 60, 1) if v is not None else None)
+                _t.sleep(1.0)   # be polite to the public server
+                return out
+            log(f"    OSRM error {resp.status_code} (attempt {attempt}/3)")
+        except Exception as e:
+            log(f"    OSRM request failed ({e}) (attempt {attempt}/3)")
+        _t.sleep(5 * attempt)
+    return None
+
 
 def _ors_matrix_call(url, headers, payload, log):
-    """POST to ORS matrix API with one retry on rate-limit (429)."""
+    """POST to ORS matrix API with one retry on rate-limit (429).
+    On a 403 (daily quota dead), fails over ONCE to ORS_API_KEY_2 if set."""
     import time as _t
     import requests as _rq
     waits = {1: 10, 2: 30, 3: 60, 4: 120}
+    headers = dict(headers)
+    if _ORS_KEY_STATE["active"]:
+        headers["Authorization"] = _ORS_KEY_STATE["active"]
     for attempt in (1, 2, 3, 4, 5):
         try:
             resp = _rq.post(url, headers=headers, json=payload, timeout=60)
             if resp.status_code == 403:
+                _backup = _ors_backup_key()
+                if _backup and not _ORS_KEY_STATE["switched"]:
+                    _ORS_KEY_STATE["active"] = _backup
+                    _ORS_KEY_STATE["switched"] = True
+                    headers["Authorization"] = _backup
+                    log("    ORS primary key quota exhausted (403) — SWITCHING to backup "
+                        "key (ORS_API_KEY_2) and retrying...")
+                    continue
                 _ORS_QUOTA_HIT["v"] = True
                 _rem = resp.headers.get("x-ratelimit-remaining", "?")
                 _rst = resp.headers.get("x-ratelimit-reset", "?")
-                log(f"    ORS DAILY quota exhausted (403) — remaining: {_rem}, resets: {_rst}. "
+                log(f"    ORS DAILY quota exhausted (403"
+                    f"{', backup key too' if _ORS_KEY_STATE['switched'] else ''}) — "
+                    f"remaining: {_rem}, resets: {_rst}. "
                     f"Aborting remaining ORS work for this run.")
                 return resp
             if resp.status_code == 429 and attempt < 4:
@@ -663,12 +735,13 @@ def add_dogs_to_matrix(creds, matrix, missing_dogs, schedule_data, file_id, matr
 
     _ORS_QUOTA_HIT["v"] = False
     added_count = 0
+    fallback_ids = []   # dogs measured via OSRM (quota backup) — re-measured with ORS next run
     # soonest-scheduled first (earliest date column wins; temps last)
     for new_id, new_coords in sorted(missing_dogs.items(),
                                      key=lambda kv: kv[1].get("prio", 999)):
         if _ORS_QUOTA_HIT["v"]:
-            print("    Daily ORS quota exhausted — skipping remaining dogs this run.")
-            break
+            print(f"    Daily ORS quota exhausted — measuring {new_id} via OSRM "
+                  f"backup (real road times; re-measured with ORS next run).")
         print(f"  Adding {new_id}...")
         new_loc = [new_coords["lng"], new_coords["lat"]]
         new_to_existing = {}
@@ -751,11 +824,42 @@ def add_dogs_to_matrix(creds, matrix, missing_dogs, schedule_data, file_id, matr
         _cov_out = len(new_to_existing)
         _cov_in = len(existing_to_new)
         if len(nearby_ids) and (_cov_out < len(nearby_ids) // 2 or _cov_in < len(nearby_ids) // 2):
-            print(f"    {new_id}: only computed {_cov_out}/{len(nearby_ids)} outbound, "
-                  f"{_cov_in}/{len(nearby_ids)} inbound — NOT added (stays missing for a "
-                  f"future run with quota). Check ORS key/quota.")
-            continue  # never write a mostly-9999 dog
-        print(f"    {new_id}: computed {_cov_out}/{len(nearby_ids)} outbound, {_cov_in}/{len(nearby_ids)} inbound distances")
+            # QUOTA BACKUP: ORS quota died (or coverage came back too thin).
+            # Measure the gaps with REAL road driving times from the public
+            # OSRM server — same OpenStreetMap road network, no key, no daily
+            # quota. Never a straight-line estimate. ORS numbers that DID come
+            # back are kept; the dog is re-measured with ORS next run so the
+            # matrix stays homogeneous.
+            print(f"    {new_id}: ORS short ({_cov_out}/{len(nearby_ids)} out, "
+                  f"{_cov_in}/{len(nearby_ids)} in) — filling gaps via OSRM backup...")
+            for batch_start in range(0, len(nearby_ids), batch_size):
+                batch_ids = nearby_ids[batch_start:batch_start + batch_size]
+                batch_coords = nearby_coords[batch_start:batch_start + batch_size]
+                if any(bid not in new_to_existing for bid in batch_ids):
+                    vals = _osrm_table(new_loc, batch_coords, True, print)
+                    if vals:
+                        for i, bid in enumerate(batch_ids):
+                            if bid not in new_to_existing and vals[i] is not None:
+                                new_to_existing[bid] = vals[i]
+                if any(bid not in existing_to_new for bid in batch_ids):
+                    vals = _osrm_table(new_loc, batch_coords, False, print)
+                    if vals:
+                        for i, bid in enumerate(batch_ids):
+                            if bid not in existing_to_new and vals[i] is not None:
+                                existing_to_new[bid] = vals[i]
+            _cov_out = len(new_to_existing)
+            _cov_in = len(existing_to_new)
+            if _cov_out < len(nearby_ids) // 2 or _cov_in < len(nearby_ids) // 2:
+                print(f"    {new_id}: OSRM backup also short ({_cov_out}/{len(nearby_ids)} out, "
+                      f"{_cov_in}/{len(nearby_ids)} in) — NOT added (stays missing for a "
+                      f"future run). Never writing a mostly-9999 dog.")
+                continue
+            fallback_ids.append(new_id)
+            print(f"    {new_id}: ✅ added with OSRM road times "
+                  f"({_cov_out}/{len(nearby_ids)} out, {_cov_in}/{len(nearby_ids)} in); "
+                  f"queued for ORS re-measure next run.")
+        else:
+            print(f"    {new_id}: computed {_cov_out}/{len(nearby_ids)} outbound, {_cov_in}/{len(nearby_ids)} inbound distances")
 
         # Update CSV
         header.append(new_id)
@@ -794,6 +898,35 @@ def add_dogs_to_matrix(creds, matrix, missing_dogs, schedule_data, file_id, matr
     )
     drive.files().update(fileId=file_id, media_body=media).execute()
     print("Done!")
+
+    # QUOTA BACKUP bookkeeping: every OSRM-measured dog gets an AddressLog row
+    # with a BLANK measured-address. Next run, the address-change (mover)
+    # machinery sees blank != current address and re-measures the dog with ORS
+    # — no new code path, the existing repair loop does the work.
+    if fallback_ids:
+        try:
+            import datetime as _dt
+            gc2 = gspread.authorize(creds)
+            _rsid = os.environ.get("ROUTING_SHEET_ID", "").strip()
+            _book = gc2.open_by_key(_rsid) if _rsid else gc2.open(
+                os.environ.get("ROUTING_SHEET_NAME", "Routing"))
+            _ws = _book.worksheet("AddressLog")
+            _have = {r[0].strip() for r in _ws.get_all_values() if r and r[0].strip()}
+            _rows = []
+            for cid in fallback_ids:
+                if cid in _have:
+                    continue
+                _c = missing_dogs.get(cid, {})
+                _rows.append([cid, "", f"{_c.get('lat','')},{_c.get('lng','')}",
+                              "OSRM " + _dt.date.today().isoformat()])
+            if _rows:
+                _ws.append_rows(_rows)
+            print(f"  {len(fallback_ids)} OSRM-measured dog(s) queued for automatic "
+                  f"re-measure next run: {', '.join(fallback_ids)}")
+        except Exception as e:
+            print(f"  ⚠️ Could not queue OSRM-measured dogs for re-measure ({e}) — "
+                  f"blank their AddressLog col-B cells by hand to force it: "
+                  f"{', '.join(fallback_ids)}")
     return matrix, added_count
 
 
