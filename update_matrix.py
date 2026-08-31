@@ -141,7 +141,7 @@ def ors_geocode(address, ors_key):
             break
     try:
         r = requests.get(
-            "https://api.openrouteservice.org/geocode/search",
+            "https://api.heigit.org/pelias/v1/search",
             params={"api_key": _ors_auth(ors_key), "text": address,
                     "boundary.country": "US", "size": 3},
             timeout=15,
@@ -151,7 +151,7 @@ def ors_geocode(address, ors_key):
             _ORS_KEY_STATE["switched"] = True
             print("  ORS primary key quota exhausted on geocode — switching to backup key (ORS_API_KEY_2)")
             r = requests.get(
-                "https://api.openrouteservice.org/geocode/search",
+                "https://api.heigit.org/pelias/v1/search",
                 params={"api_key": _ORS_KEY_STATE["active"], "text": address,
                         "boundary.country": "US", "size": 3},
                 timeout=15,
@@ -455,7 +455,7 @@ def check_address_changes(creds, schedule_data, matrix, ors_key, schedule_sheet_
                     payload = {"locations": locations, "sources": list(range(len(chunk))),
                                "destinations": [len(chunk)], "metrics": ["duration"]}
                 resp = _ors_matrix_call(
-                    "https://api.openrouteservice.org/v2/matrix/driving-car",
+                    "https://api.heigit.org/openrouteservice/v2/matrix/driving-car",
                     {"Authorization": ors_key, "Content-Type": "application/json"},
                     payload, print)
                 if resp is not None and resp.status_code == 200:
@@ -784,7 +784,7 @@ def add_dogs_to_matrix(creds, matrix, missing_dogs, schedule_data, file_id, matr
             # New → existing
             try:
                 resp = _ors_matrix_call(
-                    "https://api.openrouteservice.org/v2/matrix/driving-car",
+                    "https://api.heigit.org/openrouteservice/v2/matrix/driving-car",
                     {"Authorization": ors_key, "Content-Type": "application/json"},
                     {"locations": locations, "sources": [0],
                      "destinations": destinations, "metrics": ["duration"]},
@@ -804,7 +804,7 @@ def add_dogs_to_matrix(creds, matrix, missing_dogs, schedule_data, file_id, matr
             # Existing → new
             try:
                 resp = _ors_matrix_call(
-                    "https://api.openrouteservice.org/v2/matrix/driving-car",
+                    "https://api.heigit.org/openrouteservice/v2/matrix/driving-car",
                     {"Authorization": ors_key, "Content-Type": "application/json"},
                     {"locations": locations, "sources": destinations,
                      "destinations": [0], "metrics": ["duration"]},
@@ -1234,7 +1234,7 @@ def repair_9999s(creds, matrix, schedule_data, file_id, matrix_text, ors_key):
                 [coords_lookup[d]["lng"], coords_lookup[d]["lat"]] for d in chunk
             ]
             resp = _ors_matrix_call(
-                "https://api.openrouteservice.org/v2/matrix/driving-car",
+                "https://api.heigit.org/openrouteservice/v2/matrix/driving-car",
                 {"Authorization": ors_key, "Content-Type": "application/json"},
                 {"locations": locations, "sources": [0],
                  "destinations": list(range(1, len(chunk) + 1)), "metrics": ["duration"]},
