@@ -1142,14 +1142,36 @@ def repair_9999s(creds, matrix, schedule_data, file_id, matrix_text, ors_key):
     except Exception as e:
         print(f"  Warning: could not load Locations tab: {e}")
 
-    # Find 9999 pairs where we have coordinates for both
+    # Find 9999 pairs where we have coordinates for both.
+    #
+    # 7-MILE RULE (matches the add path): dog-to-dog pairs farther than 7 miles
+    # apart are 9999 ON PURPOSE — the add path never measures them because two
+    # dogs that far apart never share a route. They are correct values, not
+    # damage. Without this filter the repair pass counted every intentional
+    # far-pair as broken (166k+ "stale" pairs), burned 500 real ORS calls per
+    # run re-measuring pairs no route ever uses, and drained the daily quota
+    # every single day while the backlog only grew. Field/parking pairs are
+    # always kept — every trip touches the anchors regardless of distance.
+    def _hav_mi7(a, b):
+        p1, p2 = math.radians(a["lat"]), math.radians(b["lat"])
+        dp = math.radians(b["lat"] - a["lat"]); dl = math.radians(b["lng"] - a["lng"])
+        x = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+        return 2 * 3958.8 * math.asin(math.sqrt(x))
+
     pairs_to_fix = []
+    far_by_design = 0
     for from_id, dests in matrix.items():
         if from_id not in coords_lookup:
             continue
         for to_id, dist in dests.items():
             if dist >= 9999 and to_id in coords_lookup and from_id != to_id:
+                _anchor = (from_id.endswith(("F", "P")) or to_id.endswith(("F", "P")))
+                if not _anchor and _hav_mi7(coords_lookup[from_id], coords_lookup[to_id]) > 7:
+                    far_by_design += 1
+                    continue                    # intentional far-pair — leave it alone
                 pairs_to_fix.append((from_id, to_id))
+    if far_by_design:
+        print(f"  ({far_by_design} far-apart 9999 pairs skipped — beyond 7 miles, correct by design)")
 
     if not pairs_to_fix:
         print("  No 9999 entries to repair.")
