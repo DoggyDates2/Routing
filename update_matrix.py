@@ -1125,11 +1125,20 @@ def repair_9999s(creds, matrix, schedule_data, file_id, matrix_text, ors_key):
             if _ll:
                 coords_lookup[cid] = {"lat": _ll[0], "lng": _ll[1]}
 
-    # Load field/parking coords from Locations tab
+    # Load field/parking coords from Locations tab.
+    # BY ID FIRST (matches every other function): opening by NAME failed on
+    # every run ("could not load Locations tab") — which silently excluded all
+    # field/parking anchors from repair, so broken anchor distances (e.g. a
+    # driver's parking spot reading 9999 to her own drop-offs) never got fixed
+    # and routes ignored parking. (Holly Trip 4 bug, Aug 31 2026.)
     try:
-        sheet_name = os.environ.get("ROUTING_SHEET_NAME", "Routing")
         client = gspread.authorize(creds)
-        loc_ws = client.open(sheet_name).worksheet("Locations")
+        routing_sheet_id = os.environ.get("ROUTING_SHEET_ID", "").strip()
+        if routing_sheet_id:
+            loc_book = client.open_by_key(routing_sheet_id)
+        else:
+            loc_book = client.open(os.environ.get("ROUTING_SHEET_NAME", "Routing"))
+        loc_ws = loc_book.worksheet("Locations")
         for row in loc_ws.get_all_values()[1:]:
             if len(row) >= 3:
                 loc_id = row[0].strip()
