@@ -2337,7 +2337,7 @@ def auto_add_to_matrix(client, matrix, missing_dogs, schedule_data):
             # New → existing
             try:
                 resp = _ors_matrix_call(
-                    "https://api.openrouteservice.org/v2/matrix/driving-car",
+                    "https://api.heigit.org/openrouteservice/v2/matrix/driving-car",
                     {"Authorization": ors_key, "Content-Type": "application/json"},
                     {"locations": locations, "sources": [0],
                      "destinations": destinations, "metrics": ["duration"]},
@@ -2355,7 +2355,7 @@ def auto_add_to_matrix(client, matrix, missing_dogs, schedule_data):
             # Existing → new
             try:
                 resp = _ors_matrix_call(
-                    "https://api.openrouteservice.org/v2/matrix/driving-car",
+                    "https://api.heigit.org/openrouteservice/v2/matrix/driving-car",
                     {"Authorization": ors_key, "Content-Type": "application/json"},
                     {"locations": locations, "sources": destinations,
                      "destinations": [0], "metrics": ["duration"]},
@@ -2607,7 +2607,7 @@ def main():
                 if _ad and _ors_key:
                     try:
                         _r = _rq.get(
-                            "https://api.openrouteservice.org/geocode/search",
+                            "https://api.heigit.org/pelias/v1/search",
                             params={"api_key": _ors_key, "text": _ad,
                                     "boundary.country": "US", "size": 1},
                             timeout=15,
@@ -2825,7 +2825,7 @@ def main():
                 if _addr and _ors_key:
                     try:
                         _r = _rq.get(
-                            "https://api.openrouteservice.org/geocode/search",
+                            "https://api.heigit.org/pelias/v1/search",
                             params={"api_key": _ors_key, "text": _addr,
                                     "boundary.country": "US", "size": 1},
                             timeout=15,
