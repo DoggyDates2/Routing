@@ -645,11 +645,15 @@ def _ors_matrix_call(url, headers, payload, log):
             if resp.status_code == 403:
                 try:
                     _k = headers.get("Authorization") or ""
-                    _body = resp.text.replace(_k, "<KEY>") if _k else resp.text
-                    log(f"    ORS 403 detail ({'backup' if _ORS_KEY_STATE['switched'] else 'primary'} key "
-                        f"{_k[:6]}...{_k[-4:]}, len {len(_k)}): {_body[:200].strip()}")
-                except Exception:
-                    pass
+                    _same = (_ORS_KEY_STATE["switched"] and _k == os.environ.get("ORS_API_KEY", "").strip())
+                    _body = (resp.text or "").replace(_k, "<KEY>")[:160].strip()
+                    # spaced-out so GitHub's secret masking can't hide the message
+                    _spaced = " ".join(_body)
+                    log(f"    ORS 403 detail ({'backup' if _ORS_KEY_STATE['switched'] else 'primary'} key, "
+                        f"len {len(_k)}, backup==primary: {_same}, status {resp.status_code}, "
+                        f"content-type {resp.headers.get('content-type','?')}): {_spaced}")
+                except Exception as _e:
+                    log(f"    (403 detail unavailable: {_e})")
                 _backup = _ors_backup_key()
                 if _backup and not _ORS_KEY_STATE["switched"]:
                     _ORS_KEY_STATE["active"] = _backup
