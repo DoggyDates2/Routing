@@ -1212,7 +1212,7 @@ def repair_9999s(creds, matrix, schedule_data, file_id, matrix_text, ors_key):
     # Fix up to 500 dog-dog pairs per run, plus a MUCH larger budget for
     # field/parking pairs (every trip touches them; after an anchor reset the
     # grouped calls make even thousands of anchor pairs only ~50-100 requests)
-    batch = priority_pairs[:4000] + other_pairs[:500]
+    batch = priority_pairs[:4000] + other_pairs[:150]   # 150 (was 500): leave daily quota for address changes + new dogs in the 11am/2pm runs
     print(f"  Found {len(pairs_to_fix)} pairs with 9999 ({len(priority_pairs)} involve fields/parking). Fixing {len(batch)} this run...")
 
     # Parse CSV for editing
