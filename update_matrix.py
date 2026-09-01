@@ -1030,6 +1030,24 @@ def audit_matrix_health(creds, matrix, schedule_data, auto_queue=2):
                     break
                 for i, r in enumerate(log_rows, start=1):
                     if r and r[0].strip() == a and (len(r) < 2 or r[1].strip()):
+                        # LOOP GUARD: if this dog was ALREADY re-measured in the
+                        # last 7 days (AddressLog col D) and still looks wrong,
+                        # re-measuring again won't change anything — the problem
+                        # is its coordinates or a real road-access quirk (dead-end
+                        # street, no through road). Re-queueing it every run only
+                        # hogs mover slots and quota (1x/1733x looped all day
+                        # Aug 31, starving every other mover). Leave it listed on
+                        # MatrixHealth for a human instead.
+                        _last = (r[3].strip() if len(r) > 3 else "")
+                        try:
+                            _age = (datetime.date.today()
+                                    - datetime.date.fromisoformat(_last[:10])).days
+                        except Exception:
+                            _age = 999
+                        if _age <= 7:
+                            print(f"    NOT re-queued {a}: already re-measured {_last[:10]} and still "
+                                  f"flagged — check its coordinates/road access by hand ({evid})")
+                            break
                         ws2.update(range_name=f"B{i}", values=[[""]])
                         print(f"    auto-queued {a} for re-measurement tonight ({evid})")
                         queued += 1
