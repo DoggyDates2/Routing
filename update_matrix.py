@@ -643,6 +643,11 @@ def _ors_matrix_call(url, headers, payload, log):
         try:
             resp = _rq.post(url, headers=headers, json=payload, timeout=60)
             if resp.status_code == 403:
+                try:
+                    log(f"    ORS 403 detail ({'backup' if _ORS_KEY_STATE['switched'] else 'primary'} key, "
+                        f"key length {len(headers.get('Authorization') or '')}): {resp.text[:160].strip()}")
+                except Exception:
+                    pass
                 _backup = _ors_backup_key()
                 if _backup and not _ORS_KEY_STATE["switched"]:
                     _ORS_KEY_STATE["active"] = _backup
