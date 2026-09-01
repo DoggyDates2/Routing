@@ -1258,8 +1258,8 @@ def repair_9999s(creds, matrix, schedule_data, file_id, matrix_text, ors_key):
     def _fill_from_source(src_id, dest_ids):
         filled = 0
         for k in range(0, len(dest_ids), 45):
-            if _ORS_QUOTA_HIT["v"]:
-                return filled
+            if _ORS_QUOTA_HIT["v"] or _ORS_KEY_STATE["switched"]:
+                return filled   # repair never spends the backup key
             chunk = dest_ids[k:k + 45]
             locations = [[coords_lookup[src_id]["lng"], coords_lookup[src_id]["lat"]]] + [
                 [coords_lookup[d]["lng"], coords_lookup[d]["lat"]] for d in chunk
@@ -1284,6 +1284,14 @@ def repair_9999s(creds, matrix, schedule_data, file_id, matrix_text, ors_key):
         return filled
 
     for _src, _dests in _fwd.items():
+        if _ORS_KEY_STATE["switched"]:
+            # REPAIR NEVER TOUCHES THE BACKUP KEY. Sep 1 2026: the 2am run's repair
+            # pass drained the primary AND the backup, leaving zero quota for
+            # address changes / new dogs for the rest of the day. The backup is
+            # reserved for that mission-critical work; the backlog can wait.
+            print("    Primary key exhausted — repair pass stops here (backup key is "
+                  "reserved for address changes and new dogs).")
+            break
         if _ORS_QUOTA_HIT["v"]:
             print("    Daily ORS quota exhausted — stopping repair pass for this run.")
             break
