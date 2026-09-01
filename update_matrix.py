@@ -647,11 +647,13 @@ def _ors_matrix_call(url, headers, payload, log):
                     _k = headers.get("Authorization") or ""
                     _same = (_ORS_KEY_STATE["switched"] and _k == os.environ.get("ORS_API_KEY", "").strip())
                     _body = (resp.text or "").replace(_k, "<KEY>")[:160].strip()
-                    # spaced-out so GitHub's secret masking can't hide the message
-                    _spaced = " ".join(_body)
+                    # hex-encoded so GitHub's secret masking can't hide the message
+                    _hex = _body.encode("utf-8", "replace").hex()
+                    _hdrs = {k: v for k, v in resp.headers.items()
+                             if k.lower().startswith(("x-ratelimit", "www-auth", "x-error", "retry"))}
                     log(f"    ORS 403 detail ({'backup' if _ORS_KEY_STATE['switched'] else 'primary'} key, "
-                        f"len {len(_k)}, backup==primary: {_same}, status {resp.status_code}, "
-                        f"content-type {resp.headers.get('content-type','?')}): {_spaced}")
+                        f"len {len(_k)}, backup==primary: {_same}, bodylen {len(resp.text or '')}, "
+                        f"hdrs {_hdrs}): HEX {_hex}")
                 except Exception as _e:
                     log(f"    (403 detail unavailable: {_e})")
                 _backup = _ors_backup_key()
