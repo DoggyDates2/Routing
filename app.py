@@ -556,6 +556,31 @@ def parse_schedule(schedule_data, date_col_idx):
         # billing not to charge). Codes ending in a digit are normal.
         no_dropoff = bool(code.strip()) and not code.strip()[-1].isdigit()
 
+        # ── XX codes (Elizabeth, Sep 2026 spec) ─────────────────────────
+        # [P]XX[D]: digit before XX = pickup group; digit after = drop-off
+        # group (drop happens in trip D+1). A missing side = no stop on that
+        # side: the dog starts or ends the day at the DRIVER'S home.
+        # Capacity/checklist span = (P or driver's first group) .. (D or
+        # driver's last group). "1XX23" (3+ digits) stays the sleepover
+        # sentinel: capacity all day, no stops, one pinned display row.
+        #   1XX3 -> pickup t1, drop t4 (unchanged)   1XX -> pickup t1, no drop, seat all day
+        #   XX2  -> NO pickup, drop t3, seat groups 1-2   1XX1 -> group 1 only
+        # ── Potty codes (Elizabeth, Sep 2026): "NPotty" = a routed VISIT during
+        # trip N (N may be 1-4; trip 4 is the final drop-off run). The driver
+        # stops at the house, lets the dog potty, and continues — the dog never
+        # boards the van, takes NO capacity, and belongs to NO group/checklist.
+        is_potty = "potty" in code.lower()
+
+        no_pickup = False
+        _xm = re.search(r"(\d?)\s*[Xx]{2}\s*(\d*)", code)
+        if _xm and not is_ride_along:
+            _pre, _post = _xm.group(1), _xm.group(2)
+            no_pickup = (_pre == "" and _post != "")
+            _xx_pickup = int(_pre) if _pre else 1          # open start: on board from first trip
+            _xx_dropoff = int(_post[-1]) if _post else 3   # open end: stays on board to last trip
+        else:
+            _xx_pickup = _xx_dropoff = None
+
         # Handle "!" split — dog goes home between groups (e.g., "1!3" = group 1, then group 3 separately)
         if "!" in code:
             sub_codes = code.split("!")
@@ -568,7 +593,9 @@ def parse_schedule(schedule_data, date_col_idx):
                     "driver": driver_name,
                     "pickup_group": int(digits[0]),
                     "dropoff_group": int(digits[-1]),
+                    "no_pickup": False,
                     "no_dropoff": no_dropoff,
+                    "is_potty": is_potty,
                     "dog_count": dog_count,
                     "is_staff_dog": (email == ""),
                     "is_ride_along": is_ride_along,
@@ -583,9 +610,11 @@ def parse_schedule(schedule_data, date_col_idx):
             assignments.append({
                 "customer_id": customer_id,
                 "driver": driver_name,
-                "pickup_group": int(digits[0]),
-                "dropoff_group": int(digits[-1]),
+                "pickup_group": _xx_pickup if _xx_pickup is not None else int(digits[0]),
+                "dropoff_group": _xx_dropoff if _xx_dropoff is not None else int(digits[-1]),
+                "no_pickup": no_pickup,
                 "no_dropoff": no_dropoff,
+                "is_potty": is_potty,
                 "dog_count": dog_count,
                 "is_staff_dog": (email == ""),
                 "is_ride_along": is_ride_along,
@@ -636,9 +665,20 @@ def derive_groups(assignments, driver_name):
     back to the field after their real last group instead of to parking."""
     driver_dogs = [a for a in assignments if a["driver"] == driver_name
                    and not a["is_staff_dog"] and not a.get("is_ride_along")]
-    pickup_groups = set(a["pickup_group"] for a in driver_dogs)
-    return sorted(pickup_groups)
-    return drivers
+    if not driver_dogs:
+        return []
+    # Trips are CONTIGUOUS from the first pickup group to the last. Using the
+    # set of pickup groups alone skips the return run for an in-between group:
+    # a driver with pickups in groups 1 and 3 (no group 2) jumped 1 -> 3 and
+    # Group-1-only dogs missed their Trip 2 drop-off (the "Otten bug").
+    # no_pickup (XXD) dogs don't create pickup groups.
+    _pgs = [a["pickup_group"] for a in driver_dogs
+            if not a.get("no_pickup") and not a.get("is_potty")]
+    if not _pgs:
+        _pgs = [a["dropoff_group"] for a in driver_dogs if not a.get("is_potty")]
+    if not _pgs:
+        return []
+    return list(range(min(_pgs), max(_pgs) + 1))
 
 
 # =============================================================================
@@ -790,6 +830,30 @@ def solve_driver(matrix, driver_name, config, dogs, schedule_lookup):
         _note_row("⚠️ NO PARKING ID",
                   "No parking ID in the Staff tab — route starts and ends at the field.")
 
+    # ── Sleepover ride-alongs (1XX23): no stops anywhere, but the dog appears
+    # ONCE on the schedule — pinned as the first row of Trip 1, full details
+    # incl. home address (informational: the dog rides from the driver's home).
+    # Display-only: never optimized, never a real stop (Elizabeth, Sep 2026). ──
+    if groups:
+        for _ra in staff_dogs:
+            if not _ra.get("is_ride_along") or _ra.get("is_staff_dog"):
+                continue
+            _rx = get_extra_info(_ra["customer_id"])
+            results.append({
+                "Driver": driver_name, "Leg": groups[0], "Stop": 0,
+                "Action": "RIDE-ALONG", "Customer ID": _ra["customer_id"],
+                "Dog Name": "🛏️ " + (_ra.get("dog_name") or _ra["customer_id"]) +
+                            " | RIDE-ALONG (from driver's home)",
+                "Address": _ra.get("address", ""),
+                "Phone": _rx.get("Phone", ""),
+                "Customer Name": _rx.get("Customer Name", ""),
+                "Instructions": _rx.get("Instructions", ""),
+                "Dog Breed": _rx.get("Dog Breed", ""),
+                "House Description": _rx.get("House Description", ""),
+                "Dogs at Stop": "", "Dogs on Board": "",
+                "Assignment": _ra.get("raw", "") or driver_name, "Drive Min": "",
+            })
+
     if not field:
         # ── NO STAFF ANCHORS: never skip anyone. Route house-to-house per group,
         #    nearest-neighbor order, no parking start / field stops / capacity. ──
@@ -856,7 +920,12 @@ def solve_driver(matrix, driver_name, config, dogs, schedule_lookup):
             pickup_dogs = [
                 d for d in customer_dogs
                 if d["pickup_group"] == current_group and d["customer_id"] in matrix
+                and not d.get("no_pickup") and not d.get("is_potty")
             ]
+            # Potty visits scheduled during this trip ride along as plain stops
+            pickup_dogs += [d for d in customer_dogs if d.get("is_potty")
+                            and d["pickup_group"] == current_group
+                            and d["customer_id"] in matrix]
             if not pickup_dogs:
                 continue
 
@@ -928,13 +997,19 @@ def solve_driver(matrix, driver_name, config, dogs, schedule_lookup):
                 (d["customer_id"], d["dog_count"])
                 for d in customer_dogs
                 if d["pickup_group"] == next_group and d["customer_id"] in matrix
+                and not d.get("no_pickup") and not d.get("is_potty")
             ]
+            # Potty visits during this trip: routed stop, ZERO capacity demand
+            pickups += [(d["customer_id"], 0) for d in customer_dogs
+                        if d.get("is_potty") and d["pickup_group"] == next_group
+                        and d["customer_id"] in matrix]
 
             staying_customer = sum(
                 d["dog_count"] for d in customer_dogs
                 if d["pickup_group"] < next_group
                 and d["dropoff_group"] > prev_group
                 and d["pickup_group"] <= prev_group
+                and not d.get("is_potty")
             )
             staying_staff = sum(
                 d["dog_count"] for d in staff_dogs
@@ -1055,6 +1130,11 @@ def solve_driver(matrix, driver_name, config, dogs, schedule_lookup):
                 if d["dropoff_group"] >= last_group and d["customer_id"] in matrix
                 and not d.get("no_dropoff")
             ]
+            # Potty visits during the FINAL trip (label = last group + 1):
+            # routed into the drop-off run as plain stops (no capacity there).
+            dropoff_dogs += [d for d in customer_dogs if d.get("is_potty")
+                             and d["pickup_group"] == last_group + 1
+                             and d["customer_id"] in matrix]
             if not dropoff_dogs:
                 continue
 
@@ -1106,9 +1186,12 @@ def solve_driver(matrix, driver_name, config, dogs, schedule_lookup):
                   f"stops for this dog ({_inmx}) — pickup/drop-off appended manually "
                   f"at the end of its trips. Drive order for it is NOT optimized.")
         _extra = get_extra_info(d["customer_id"])
-        _acts = [("PICK UP", d["pickup_group"])]
-        if not d.get("no_dropoff"):
-            _acts.append(("DROP OFF", d["dropoff_group"] + 1))
+        if d.get("is_potty"):
+            _acts = [("POTTY", d["pickup_group"])]
+        else:
+            _acts = [] if d.get("no_pickup") else [("PICK UP", d["pickup_group"])]
+            if not d.get("no_dropoff"):
+                _acts.append(("DROP OFF", d["dropoff_group"] + 1))
         for _act, _lg in _acts:
             results.append({
                 "Driver": driver_name, "Leg": _lg, "Stop": 999,
@@ -1125,6 +1208,17 @@ def solve_driver(matrix, driver_name, config, dogs, schedule_lookup):
                 "Assignment": d.get("raw", "") or driver_name,
                 "Drive Min": "",
             })
+
+    # ── Potty rows: relabel as POTTY visits (not pickups/drops) so they never
+    # count as group membership (checklist ignores non-PICK UP/DROP OFF) and
+    # drivers see at a glance it's a stop-and-go visit. ──
+    _potty_ids = {d["customer_id"] for d in customer_dogs if d.get("is_potty")}
+    for r in results:
+        if r.get("Customer ID") in _potty_ids and r.get("Action") in ("PICK UP", "DROP OFF"):
+            r["Action"] = "POTTY"
+            _nm = (r.get("Dog Name") or "").replace("◼", "").strip()
+            r["Dog Name"] = "🚽 " + _nm + " | POTTY BREAK (no pickup)"
+            r["Dogs at Stop"] = ""
 
     return _apply_dir_temp_display(results)
 
@@ -1385,13 +1479,18 @@ def _surgical_compute(rows, matrix, driver_name, config, assignments, schedule_l
         if c == target_cid:
             continue  # a dog being moved must not vote with its old position
         al = sched_by_cid.get(c)
-        if al:
+        # Ride-alongs (pinned display row) and no-pickup XX dogs have no real
+        # pickup stop — their first sheet row is NOT a pickup-trip signal.
+        if al and not al[0].get("is_ride_along") and not al[0].get("no_pickup") \
+                and not al[0].get("is_potty"):
             _pv.setdefault(al[0]["pickup_group"], _Counter())[t] += 1
     for c, t in last_seen.items():
         if c == target_cid:
             continue
         al = sched_by_cid.get(c)
-        if al:
+        # Ride-alongs and no-dropoff dogs (PXX, Potty) have no drop stop —
+        # their last sheet row is NOT a drop-trip signal.
+        if al and not al[0].get("is_ride_along") and not al[0].get("no_dropoff"):
             _dv.setdefault(al[0]["dropoff_group"], _Counter())[t] += 1
     trip_of_pickup = {g: v.most_common(1)[0][0] for g, v in _pv.items()}
     trip_of_dropoff = {g: v.most_common(1)[0][0] for g, v in _dv.items()}
@@ -1867,6 +1966,26 @@ def surgical_apply(client, sheet_name, matrix, driver_name, config, assignments,
     return report
 
 
+def _checklist_groups(code_part):
+    """Groups a dog appears in on the CHECKLIST, from one code segment.
+    XX rule (Elizabeth, Sep 2026): span = (digit before XX, else group 1)
+    through (digit after XX, else group 3) — same as the capacity span.
+      1XX -> 1,2,3   1XX1 -> 1   XX1 -> 1   XX2 -> 1,2   2XX2 -> 2   1XX23 -> 1,2,3
+    Non-XX codes keep the classic first-digit..last-digit span."""
+    import re as _re
+    if "potty" in code_part.lower():
+        return range(0)   # potty visits are never IN a group
+    m = _re.search(r"(\d?)\s*[Xx]{2}\s*(\d*)", code_part)
+    if m:
+        start = int(m.group(1)) if m.group(1) else 1
+        end = int(m.group(2)[-1]) if m.group(2) else 3
+        return range(start, end + 1)
+    digits = _re.findall(r"\d", code_part)
+    if not digits:
+        return range(0)
+    return range(int(digits[0]), int(digits[-1]) + 1)
+
+
 def build_driver_checklist(results, ride_alongs=None):
     """Build a flat checklist of all dogs organized by driver and group.
     ride_alongs: XX-code dogs from the schedule — never routed, but they ride in
@@ -1885,7 +2004,8 @@ def build_driver_checklist(results, ride_alongs=None):
             continue
         
         # Strip symbols from dog name to get clean name
-        clean_name = strip_birthday_symbols(raw_name).replace("◼", "").replace("2️⃣", "").replace("3️⃣", "").strip()
+        clean_name = strip_birthday_symbols(raw_name).replace("◼", "").replace("2️⃣", "").replace("3️⃣", "").replace("🛏️", "").strip()
+        clean_name = clean_name.split("| RIDE-ALONG")[0].strip()
         # Remove "X & Y" prefix
         import re as _re
         clean_name = _re.sub(r'^\d+\s*&\s*\d+\s*', '', clean_name).strip()
@@ -1901,10 +2021,8 @@ def build_driver_checklist(results, ride_alongs=None):
             code = raw.split(":")[1]
             parts = code.split("!") if "!" in code else [code]
             for part in parts:
-                digits = _re.findall(r"\d", part)
-                if digits:
-                    for g in range(int(digits[0]), int(digits[-1]) + 1):
-                        dog_groups[key].add(g)
+                for g in _checklist_groups(part):
+                    dog_groups[key].add(g)
     
     # If dog_groups is empty, try building from assignments in results
     if not dog_groups:
@@ -1928,17 +2046,9 @@ def build_driver_checklist(results, ride_alongs=None):
             
             if ":" in raw:
                 code = raw.split(":")[1]
-                if "!" in code:
-                    for part in code.split("!"):
-                        digits = _re.findall(r'\d', part)
-                        if digits:
-                            for g in range(int(digits[0]), int(digits[-1]) + 1):
-                                dog_groups[key].add(g)
-                else:
-                    digits = _re.findall(r'\d', code)
-                    if digits:
-                        for g in range(int(digits[0]), int(digits[-1]) + 1):
-                            dog_groups[key].add(g)
+                for part in (code.split("!") if "!" in code else [code]):
+                    for g in _checklist_groups(part):
+                        dog_groups[key].add(g)
 
     # Inject ride-along (XX) dogs — they have no route rows to derive from
     if ride_alongs:
