@@ -1944,7 +1944,7 @@ def surgical_apply(client, sheet_name, matrix, driver_name, config, assignments,
               "Driver Trip", "Customer ID"]
     checklist_rows = build_driver_checklist(
         rows_to_checklist_results(final_rows),
-        [a for a in assignments if a.get("is_ride_along") and not a["is_staff_dog"]],
+        _checklist_injects(assignments),
     )
     _seq = {}
     for _r in final_rows:
@@ -1986,10 +1986,20 @@ def _checklist_groups(code_part):
     return range(int(digits[0]), int(digits[-1]) + 1)
 
 
+def _checklist_injects(assignments):
+    """Dogs that get NO route rows but still belong on the checklist:
+    XX ride-alongs AND staff dogs (blank email col E). Both ride in the van and
+    take capacity, so the driver still needs to see them. Potty visits never
+    board the van and are never on the checklist."""
+    return [a for a in assignments
+            if (a.get("is_ride_along") or a.get("is_staff_dog"))
+            and not a.get("is_potty")]
+
+
 def build_driver_checklist(results, ride_alongs=None):
     """Build a flat checklist of all dogs organized by driver and group.
-    ride_alongs: XX-code dogs from the schedule — never routed, but they ride in
-    the van all day, so they're injected here for every group in their span."""
+    ride_alongs: dogs with no route rows — XX ride-alongs and staff dogs — that
+    ride in the van, so they're injected here for every group in their span."""
     # Collect all dogs by driver and the groups they participate in
     # Use the results to figure out which drivers and dogs exist
     dog_groups = {}  # (driver, customer_id, dog_name) → set of groups
@@ -3286,7 +3296,7 @@ def main():
             try:
                 count = write_results_to_sheet(
                     client, SHEET_NAME, all_results, selected_drivers, selected_date,
-                    ride_alongs=[a for a in assignments if a.get("is_ride_along") and not a["is_staff_dog"]],
+                    ride_alongs=_checklist_injects(assignments),
                 )
                 save_snapshot(client, SHEET_NAME, assignments, snapshot_date=selected_date)
                 st.session_state["write_success"] = f"✅ Wrote {count} total rows to '{OUTPUT_TAB_NAME}' (updated {len(selected_drivers)} drivers, kept others)."
