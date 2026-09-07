@@ -1227,9 +1227,24 @@ def solve_driver(matrix, driver_name, config, dogs, schedule_lookup):
 # WRITE TO SHEET
 # =============================================================================
 
+def _retry_429(fn, waits=(20, 30, 45)):
+    """Run fn(); on a Sheets 'per minute' 429 quota error wait and retry.
+    The read quota is 60 requests/min per user and resets within a minute, so a
+    short wait almost always succeeds. Any other error is raised unchanged."""
+    import time as _time
+    for _w in waits:
+        try:
+            return fn()
+        except gspread.exceptions.APIError as _e:
+            if "429" not in str(_e) and "Quota exceeded" not in str(_e):
+                raise
+            _time.sleep(_w)
+    return fn()
+
+
 def write_results_to_sheet(client, sheet_name, new_results, optimized_drivers, selected_date, ride_alongs=None):
     """Write routes to sheet with date tracking."""
-    sheet = _open_output_sheet(client, sheet_name)
+    sheet = _retry_429(lambda: _open_output_sheet(client, sheet_name))
     
     header = ["Assignment", "Stop", "Dog Name", "Address", "Phone",
               "Customer Name", "Instructions", "Dog Breed", "House Description",
@@ -1239,8 +1254,8 @@ def write_results_to_sheet(client, sheet_name, new_results, optimized_drivers, s
     existing_rows = []
     custom_names = {}
     try:
-        existing_ws = sheet.worksheet(_routes_tab_name())
-        existing_data = existing_ws.get_all_values()
+        existing_ws = _retry_429(lambda: sheet.worksheet(_routes_tab_name()))
+        existing_data = _retry_429(existing_ws.get_all_values)
         
         # Check if existing data is from the same date
         existing_date = (existing_data[0][0] if existing_data and existing_data[0] else "").strip()
@@ -2791,6 +2806,17 @@ def main():
 
     scheduled_names = sorted(set(a["driver"] for a in assignments if a.get("driver")))
     st.sidebar.markdown(f"**Drivers on schedule:** {len(scheduled_names)}")
+    # Checklist-only dogs (staff + XX ride-alongs): shown here so a missing dog
+    # can be traced — if it's not in this list, the Schedule row was skipped
+    # (blank Customer ID col G, no "Driver:code", "cancel", or no digits).
+    _ck_only = _checklist_injects(assignments)
+    if _ck_only:
+        _ck_txt = ", ".join(
+            f"{(a.get('dog_name') or a['customer_id']).strip()} ({a['driver']}:{a.get('raw','').split(':',1)[-1]})"
+            for a in _ck_only)
+        st.sidebar.caption(f"📋 Checklist-only dogs (staff/XX): {len(_ck_only)} — {_ck_txt}")
+    else:
+        st.sidebar.caption("📋 Checklist-only dogs (staff/XX): 0")
     try:
         _osid = (st.secrets.get("output_sheet_id", "") or "").strip()
     except Exception:
