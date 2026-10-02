@@ -3436,6 +3436,26 @@ def main():
             st.warning(f"⚠️ {len(outliers)} long gaps between stops (over 10 min):")
             st.dataframe(pd.DataFrame(outliers), use_container_width=True, hide_index=True)
 
+        # Far parking check — flag drivers whose parking is over 12 min from their
+        # first stop. Skips drivers with no parking ID (they start at the field).
+        PARKING_FAR_MIN = 12
+        far_parking = []
+        for i in range(len(results) - 1):
+            r = results[i]
+            if r.get("Action") != "START" or str(r.get("Customer ID", "")).endswith("F"):
+                continue
+            mins = r.get("Min to Next", "")
+            if mins != "" and PARKING_FAR_MIN < mins < 9999:
+                far_parking.append({
+                    "Driver": r["Driver"],
+                    "Parking": r.get("Address", ""),
+                    "First Stop": results[i + 1]["Dog Name"],
+                    "Min from Parking": mins,
+                })
+        if far_parking:
+            st.warning(f"🅿️ {len(far_parking)} driver(s) parked over {PARKING_FAR_MIN} min from their first stop:")
+            st.dataframe(pd.DataFrame(far_parking), use_container_width=True, hide_index=True)
+
         # Capacity warning — flag drivers who exceed their nominal capacity
         over_capacity = []
         for driver_name in optimized_drivers:
