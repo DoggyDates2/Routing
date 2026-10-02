@@ -3438,23 +3438,31 @@ def main():
 
         # Far parking check — flag drivers whose parking is over 12 min from their
         # first stop. Skips drivers with no parking ID (they start at the field).
+        # Shown in the left sidebar; always shows the longest so you can see it ran.
         PARKING_FAR_MIN = 12
         far_parking = []
+        _park_longest = None
         for i in range(len(results) - 1):
             r = results[i]
             if r.get("Action") != "START" or str(r.get("Customer ID", "")).endswith("F"):
                 continue
             mins = r.get("Min to Next", "")
-            if mins != "" and PARKING_FAR_MIN < mins < 9999:
+            if mins == "" or mins >= 9999:
+                continue
+            if _park_longest is None or mins > _park_longest[1]:
+                _park_longest = (r["Driver"], mins)
+            if mins > PARKING_FAR_MIN:
                 far_parking.append({
                     "Driver": r["Driver"],
-                    "Parking": r.get("Address", ""),
                     "First Stop": results[i + 1]["Dog Name"],
-                    "Min from Parking": mins,
+                    "Min": mins,
                 })
         if far_parking:
-            st.warning(f"🅿️ {len(far_parking)} driver(s) parked over {PARKING_FAR_MIN} min from their first stop:")
-            st.dataframe(pd.DataFrame(far_parking), use_container_width=True, hide_index=True)
+            st.sidebar.warning(f"🅿️ {len(far_parking)} driver(s) parked over {PARKING_FAR_MIN} min from their first stop:")
+            st.sidebar.dataframe(pd.DataFrame(far_parking), use_container_width=True, hide_index=True)
+        elif _park_longest:
+            st.sidebar.caption(f"🅿️ Parking check: all within {PARKING_FAR_MIN} min "
+                               f"(longest: {_park_longest[0]}, {_park_longest[1]} min)")
 
         # Capacity warning — flag drivers who exceed their nominal capacity
         over_capacity = []
