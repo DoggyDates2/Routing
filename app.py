@@ -2617,7 +2617,6 @@ def main():
     # ── Load matrix from Google Drive ──
     matrix = load_matrix_from_drive(client, MATRIX_FILE_NAME)
 
-    st.sidebar.success(f"Matrix loaded: {len(matrix)} locations")
 
     # ── Load Staff from Routing sheet ──
     with st.spinner("Reading Staff data..."):
@@ -2710,11 +2709,6 @@ def main():
     _active_temps, _temp_name_ov, _temp_problems = get_active_temps(_temp_rows, _route_d)
     _TEMP_NAME_ACTIVE_CIDS.clear()
     _TEMP_NAME_ACTIVE_CIDS.update(_temp_name_ov.keys())
-    if _temp_name_ov:
-        _nm_list = ", ".join(f"{_k}\u2192{_v[0]}" for _k, _v in list(_temp_name_ov.items())[:4])
-        st.sidebar.caption(f"\U0001F4DB Temp names active for {selected_date}: {len(_temp_name_ov)} ({_nm_list})")
-    elif any((len(_tr) > 12 and _tr[12].strip()) for _tr in _temp_rows[2:]):
-        st.sidebar.caption(f"\U0001F4DB Temp names: 0 active for {selected_date} (rows exist but none match this date \u2014 check cols L\u2013O)")
     for _p in _temp_problems:
         st.warning(f"⚠️ TempAddresses: {_p}")
     _temp_missing = {o: t for o, (t, _a, _l, _m) in _active_temps.items() if t not in matrix}
@@ -2805,49 +2799,6 @@ def main():
                                       "mid": _t if _t in matrix else None}
 
     scheduled_names = sorted(set(a["driver"] for a in assignments if a.get("driver")))
-    st.sidebar.markdown(f"**Drivers on schedule:** {len(scheduled_names)}")
-    # Checklist-only dogs (staff + XX ride-alongs): shown here so a missing dog
-    # can be traced — if it's not in this list, the Schedule row was skipped
-    # (blank Customer ID col G, no "Driver:code", "cancel", or no digits).
-    _ck_only = _checklist_injects(assignments)
-    if _ck_only:
-        _ck_txt = ", ".join(
-            f"{(a.get('dog_name') or a['customer_id']).strip()} ({a['driver']}:{a.get('raw','').split(':',1)[-1]})"
-            for a in _ck_only)
-        st.sidebar.caption(f"📋 Checklist-only dogs (staff/XX): {len(_ck_only)} — {_ck_txt}")
-    else:
-        st.sidebar.caption("📋 Checklist-only dogs (staff/XX): 0")
-    try:
-        _osid = (st.secrets.get("output_sheet_id", "") or "").strip()
-    except Exception:
-        _osid = ""
-    if st.session_state.get("prep_mode"):
-        st.sidebar.caption(f"🌙 PREP MODE — writing to Routing sheet / {OUTPUT_TAB_NAME}")
-    elif _osid:
-        st.sidebar.caption(f"🗂 Routes write to: custom sheet (…{_osid[-6:]}) / {_routes_tab_name()}")
-    else:
-        st.sidebar.caption(f"🗂 Routes write to: Routing sheet / {OUTPUT_TAB_NAME}")
-    with st.sidebar.expander("🔍 Check a matrix pair"):
-        _pa = st.text_input("Dog ID A", key="pairchk_a").strip()
-        _pb = st.text_input("Dog ID B", key="pairchk_b").strip()
-        if _pa and _pb:
-            _mraw = matrix._m if isinstance(matrix, _TempMatrixView) else matrix
-            for _x, _y in ((_pa, _pb), (_pb, _pa)):
-                if _x not in _mraw:
-                    st.write(f"❌ {_x}: not in matrix")
-                elif _y not in _mraw.get(_x, {}):
-                    st.write(f"{_x} → {_y}: no entry")
-                else:
-                    _vf = float(_mraw[_x][_y])
-                    st.write(f"{_x} → {_y}: **{_vf:g} min**"
-                             + ("  ⚠️ = never measured" if _vf >= 9000 else ""))
-    _bd = load_birthdays(client, SHEET_NAME)
-    if _bd is None:
-        st.sidebar.warning("🎂 Birthdays tab NOT FOUND (checked Routing + Schedule spreadsheets)")
-    else:
-        _bs = birthday_symbols(_bd, parse_route_date(selected_date))
-        st.sidebar.caption(f"🎂 Birthdays: {len(_bd)} entries loaded, {len(_bs)} flagged for {selected_date}")
-    st.sidebar.markdown(f"**Dog assignments:** {len(assignments)}")
 
     # ── Build driver info (Schedule tab is the source of truth) ──
     active_drivers_with_dogs = []
