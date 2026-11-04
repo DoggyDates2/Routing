@@ -2239,17 +2239,26 @@ def detect_changes(assignments, snapshot):
 
 
 _ORS_QUOTA_HIT = {"v": False}
+_ORS_KEY_STATE = {"switched": False}  # True once we've failed over to ors_api_key_2
 
 
 def _ors_matrix_call(url, headers, payload, log):
-    """POST to ORS matrix API with one retry on rate-limit (429)."""
+    """POST to ORS matrix API with one retry on rate-limit (429).
+    On a 403 (daily quota dead), fails over ONCE to ors_api_key_2 if set."""
     import time as _t
     import requests as _rq
     waits = {1: 5, 2: 20, 3: 45}
     for attempt in (1, 2, 3, 4):
         try:
+            if _ORS_KEY_STATE["switched"]:
+                headers = dict(headers, Authorization=st.secrets.get("ors_api_key_2", ""))
             resp = _rq.post(url, headers=headers, json=payload, timeout=30)
             if resp.status_code == 403:
+                _backup = st.secrets.get("ors_api_key_2", "")
+                if _backup and not _ORS_KEY_STATE["switched"] and _backup != headers.get("Authorization"):
+                    _ORS_KEY_STATE["switched"] = True
+                    log("    ORS primary key quota exhausted (403) — switching to backup key (ors_api_key_2)...")
+                    continue
                 _ORS_QUOTA_HIT["v"] = True
                 _rem = resp.headers.get("x-ratelimit-remaining", "?")
                 _rst = resp.headers.get("x-ratelimit-reset", "?")
@@ -2418,6 +2427,7 @@ def auto_add_to_matrix(client, matrix, missing_dogs, schedule_data):
     completed = 0
 
     _ORS_QUOTA_HIT["v"] = False  # fresh run, fresh verdict
+    _ORS_KEY_STATE["switched"] = False
     for new_id, new_coords in missing_dogs.items():
         if _ORS_QUOTA_HIT["v"]:
             st.error(
